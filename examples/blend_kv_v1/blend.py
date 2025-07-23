@@ -58,6 +58,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
 
     llm_args = EngineArgs(
         model=model,
+        tokenizer_mode="mistral",
         kv_transfer_config=ktc,
         max_model_len=8000,
         gpu_memory_utilization=0.8,
@@ -80,11 +81,12 @@ def print_output(
 ):
     start = time.time()
     outputs = llm.generate(prompt_token_ids=prompt, sampling_params=sampling_params)
+    end = time.time()
     print("-" * 50)
     for output in outputs:
         generated_text = output.outputs[0].text
         print(f"Generated text: {generated_text!r}")
-    print(f"Generation took {time.time() - start:.2f} seconds, {req_str} request done.")
+    print(f"Generation took {end - start:.2f} seconds, {req_str} request done.")
     print("-" * 50)
 
 
@@ -143,6 +145,20 @@ def main():
             + blend_special_str
             + tokenizer.encode("Hello, how are you?")[1:]
         )
+        
+        third_prompt = (
+            sys_prompt
+            + blend_special_str
+            + chunk1_prompt
+            + blend_special_str
+            + chunk1_prompt
+            + blend_special_str
+            + chunk1_prompt
+            + blend_special_str
+            + chunk2_prompt
+            + blend_special_str
+            + tokenizer.encode("Hello, my name is")[1:]
+        )
 
         sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=10)
 
@@ -153,6 +169,11 @@ def main():
 
         # print the second output
         print_output(llm, second_prompt, sampling_params, "second")
+
+        time.sleep(1)
+
+        # print the third output
+        print_output(llm, first_prompt, sampling_params, "first repeated")
 
 
 if __name__ == "__main__":
