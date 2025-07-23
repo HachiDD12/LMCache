@@ -16,6 +16,13 @@ from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 from dataclasses import asdict
 import uvicorn
+import torch
+
+# Devstral-specific imports
+from mistral_common.protocol.instruct.messages import SystemMessage, UserMessage, AssistantMessage
+from mistral_common.protocol.instruct.request import ChatCompletionRequest as MistralChatCompletionRequest
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+from huggingface_hub import hf_hub_download
 
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -95,7 +102,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         # tensor_parallel_size=2, # TODO: add this back in once have 2 GPUs
         kv_transfer_config=ktc,
         max_model_len=32000,    # TODO: change this to 128000 once hosting devstral
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.95,
         enable_prefix_caching=False,
     )
 
@@ -117,8 +124,11 @@ class BlendServer:
         # Setup environment variables
         setup_environment_variables(use_disk, blend_special_str)
         
-        # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        # Load system prompt for Devstral
+        self.system_prompt = self.load_system_prompt(model, "SYSTEM_PROMPT.txt")
+        
+        # Initialize Devstral tokenizer
+        self.tokenizer = MistralTokenizer.from_hf_hub(model)
         
         # Initialize LLM with LMCache
         self.llm_context = build_llm_with_lmcache(self.lmcache_connector, model)
@@ -127,6 +137,17 @@ class BlendServer:
         # Create FastAPI app
         self.app = FastAPI(title="LMCache Blend Server", version="1.0.0")
         self.setup_routes()
+    
+    def load_system_prompt(self, repo_id: str, filename: str) -> str:
+        """Load system prompt from HuggingFace hub"""
+        try:
+            file_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            with open(file_path, "r") as file:
+                system_prompt = file.read()
+            return system_prompt
+        except Exception as e:
+            print(f"Warning: Could not load system prompt from {repo_id}/{filename}: {e}")
+            return "You are a very helpful assistant."
     
     def setup_routes(self):
         """Setup API routes"""
@@ -139,41 +160,25 @@ class BlendServer:
             return {"status": "healthy", "model": self.model}
     
     def messages_to_prompt(self, messages: List[ChatMessage]) -> List[int]:
-        """Convert chat messages to tokenized prompt with blending"""
-        prompt_tokens = []
+        """Convert chat messages to tokenized prompt using Devstral tokenizer"""
+        # Convert our ChatMessage format to Mistral format
+        mistral_messages = []
         
-        for i, message in enumerate(messages):
+        for message in messages:
             if message.role == "system":
-                # Encode system message
-                system_tokens = self.tokenizer.encode(message.content)
-                prompt_tokens.extend(system_tokens)
-                
-                # Add blend separator if not the last message
-                if i < len(messages) - 1:
-                    blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
-                    prompt_tokens.extend(blend_tokens)
-            
+                mistral_messages.append(SystemMessage(content=message.content))
             elif message.role == "user":
-                # Encode user message
-                user_tokens = self.tokenizer.encode(message.content)[1:]  # Remove BOS token
-                prompt_tokens.extend(user_tokens)
-                
-                # Add blend separator if not the last message
-                if i < len(messages) - 1:
-                    blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
-                    prompt_tokens.extend(blend_tokens)
-            
+                mistral_messages.append(UserMessage(content=message.content))
             elif message.role == "assistant":
-                # Encode assistant message
-                assistant_tokens = self.tokenizer.encode(message.content)[1:]  # Remove BOS token
-                prompt_tokens.extend(assistant_tokens)
-                
-                # Add blend separator if not the last message
-                if i < len(messages) - 1:
-                    blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
-                    prompt_tokens.extend(blend_tokens)
+                mistral_messages.append(AssistantMessage(content=message.content))
         
-        return prompt_tokens
+        # Create Mistral chat completion request
+        mistral_request = MistralChatCompletionRequest(messages=mistral_messages)
+        
+        # Tokenize using Devstral tokenizer
+        tokenized = self.tokenizer.encode_chat_completion(mistral_request)
+        
+        return tokenized.tokens
     
     async def handle_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request"""
@@ -201,6 +206,8 @@ class BlendServer:
             
             # Calculate usage
             input_tokens = len(prompt_tokens)
+            # For Devstral, we need to decode the generated text properly
+            # The generated text is already decoded from vLLM, so we just count tokens
             output_tokens = len(self.tokenizer.encode(generated_text))
             
             # Create response
