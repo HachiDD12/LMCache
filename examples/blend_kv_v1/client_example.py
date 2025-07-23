@@ -12,7 +12,7 @@ import time
 
 
 def chat_with_blend_server(
-    url: str = "http://localhost:8000/v1/chat/completions",
+    url: str = "http://localhost:80/v1/chat/completions",
     system_prompt: str = "You are a very helpful assistant.",
     user_message: str = "How are you today?",
     temperature: float = 0.15,
@@ -27,7 +27,7 @@ def chat_with_blend_server(
 
     # Note: model is fixed by the backend, but we still need to provide it in the request
     # The server will use its configured model regardless of what's sent
-    model = "mistralai/Mistral-7B-Instruct-v0.2"  # This will be ignored by the server
+    model = "mistralai/Devstral-Small-2507"  # This will be ignored by the server
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -70,7 +70,7 @@ def chat_with_blend_server(
 def demonstrate_blending():
     """Demonstrate the blending capabilities with multiple requests"""
     
-    url = "http://localhost:8000/v1/chat/completions"
+    url = "http://localhost:80/v1/chat/completions"
     
     # First request
     print("=== FIRST REQUEST ===")
@@ -115,7 +115,7 @@ def main():
     
     # Check if server is running
     try:
-        health_response = requests.get("http://localhost:8000/health")
+        health_response = requests.get("http://localhost:80/health")
         if health_response.status_code == 200:
             health_data = health_response.json()
             print(f"Server is healthy! Model: {health_data['model']}")
@@ -123,7 +123,7 @@ def main():
             print("Server health check failed")
             return
     except requests.exceptions.ConnectionError:
-        print("Cannot connect to server. Make sure the blend server is running on localhost:8000")
+        print("Cannot connect to server. Make sure the blend server is running on localhost:80")
         print("Start it with: python blend_server.py")
         return
     

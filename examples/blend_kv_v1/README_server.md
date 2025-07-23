@@ -1,6 +1,6 @@
-# LMCache Blend Server
+# LMCache Blend Server (Devstral)
 
-This directory contains a FastAPI server that implements LMCache blending functionality, mimicking the behavior of `blend.py` but serving as an API endpoint.
+This directory contains a FastAPI server that implements LMCache blending functionality with Devstral, mimicking the behavior of `blend.py` but serving as an API endpoint.
 
 ## Files
 
@@ -11,6 +11,7 @@ This directory contains a FastAPI server that implements LMCache blending functi
 ## Features
 
 - **LMCache Integration**: Uses LMCache for KV cache management with blending capabilities
+- **Devstral Integration**: Uses Devstral model with proper tokenizer and system prompt handling
 - **OpenAI-Compatible API**: Implements `/v1/chat/completions` endpoint
 - **Configurable Backend**: Supports both CPU and disk backends for LMCache
 - **Blending Support**: Implements the same blending logic as the original `blend.py`
@@ -24,7 +25,7 @@ This directory contains a FastAPI server that implements LMCache blending functi
 python blend_server.py
 
 # With custom model
-python blend_server.py --model mistralai/Mistral-7B-Instruct-v0.2
+python blend_server.py --model mistralai/Devstral-Small-2507
 
 # With disk backend
 python blend_server.py --use-disk
@@ -33,7 +34,7 @@ python blend_server.py --use-disk
 python blend_server.py --blend-special-str "###"
 
 # Custom host and port
-python blend_server.py --host 0.0.0.0 --port 8000
+python blend_server.py --host 0.0.0.0 --port 80
 ```
 
 ### 2. Test with Client
@@ -51,11 +52,11 @@ The server accepts requests in the same format as your example:
 import requests
 import json
 
-url = "http://localhost:8000/v1/chat/completions"
+url = "http://localhost:80/v1/chat/completions"
 headers = {"Content-Type": "application/json", "Authorization": "Bearer token"}
 
 # Note: model is fixed by the backend, but still required in request
-model = "mistralai/Mistral-7B-Instruct-v0.2"  # Will be ignored by server
+model = "mistralai/Devstral-Small-2507"  # Will be ignored by server
 
 messages = [
     {"role": "system", "content": "You are a very helpful assistant."},
@@ -105,7 +106,7 @@ Main chat completion endpoint.
 **Request Body:**
 ```json
 {
-  "model": "mistralai/Mistral-7B-Instruct-v0.2",
+  "model": "mistralai/Devstral-Small-2507",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Hello!"}
@@ -122,7 +123,7 @@ Main chat completion endpoint.
   "id": "chatcmpl-1234567890",
   "object": "chat.completion",
   "created": 1234567890,
-  "model": "mistralai/Mistral-7B-Instruct-v0.2",
+  "model": "mistralai/Devstral-Small-2507",
   "choices": [
     {
       "index": 0,
@@ -149,18 +150,26 @@ Health check endpoint.
 ```json
 {
   "status": "healthy",
-  "model": "mistralai/Mistral-7B-Instruct-v0.2"
+  "model": "mistralai/Devstral-Small-2507"
 }
 ```
+
+## Devstral Integration
+
+The server uses Devstral with proper integration:
+
+1. **System Prompt Loading**: Automatically loads SYSTEM_PROMPT.txt from the model repository
+2. **Devstral Tokenizer**: Uses MistralTokenizer for proper tokenization
+3. **Message Format**: Converts OpenAI format to Mistral format for tokenization
+4. **LMCache Integration**: Maintains LMCache blending capabilities
 
 ## Blending Logic
 
 The server implements the same blending logic as `blend.py`:
 
-1. **Message Tokenization**: Each message is tokenized separately
-2. **Blend Separators**: Special separators are inserted between messages
-3. **Chunk Management**: LMCache manages chunks of 256 tokens
-4. **Cache Reuse**: Identical chunks are reused across requests
+1. **Message Tokenization**: Each message is tokenized using Devstral tokenizer
+2. **Chunk Management**: LMCache manages chunks of 256 tokens
+3. **Cache Reuse**: Identical chunks are reused across requests
 
 ## Differences from Original blend.py
 
@@ -177,6 +186,9 @@ The server implements the same blending logic as `blend.py`:
 - uvicorn
 - vllm
 - transformers
+- torch
+- mistral-common
+- huggingface-hub
 - requests (for client)
 - lmcache
 
