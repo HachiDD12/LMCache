@@ -1423,6 +1423,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         buf = array_type.from_address(ptr)
         self.buffer = torch.frombuffer(buf, dtype=torch.uint8)
         self._unregistered = False
+        logger.info(f"Initializing MixedMemoryAllocator pinned memory with size: {size}")
 
         if use_paging:
             assert "shape" in kwargs, (

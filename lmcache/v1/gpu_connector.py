@@ -504,7 +504,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         if self.cache_positions and layer_id == 0:
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
-                            ] = memory_obj.metadata.old_positions
+                            ] = memory_obj.metadata.old_positions   # ? non existent field
 
             elif layer_id == self.num_layers:
                 yield
