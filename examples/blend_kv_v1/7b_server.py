@@ -16,13 +16,6 @@ from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 from dataclasses import asdict
 import uvicorn
-import torch
-
-# Devstral-specific imports
-from mistral_common.protocol.instruct.messages import SystemMessage, UserMessage, AssistantMessage
-from mistral_common.protocol.instruct.request import ChatCompletionRequest as MistralChatCompletionRequest
-from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-from huggingface_hub import hf_hub_download
 
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -82,7 +75,7 @@ def setup_environment_variables(
         os.environ["LMCACHE_LOCAL_CPU"] = "True"
 
         # Set the maximum size of the local CPU size to 5GB
-        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
+        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "4"
 
 
 @contextlib.contextmanager
@@ -96,25 +89,15 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     # --tokenizer_mode mistral --config_format mistral --load_format mistral --tool-call-parser mistral --enable-auto-tool-choice --tensor-parallel-size 2
     llm_args = EngineArgs(
         model=model,
-        tokenizer_mode="mistral",
-        config_format="mistral",
-        load_format="mistral",
+        # tokenizer_mode="mistral",
+        # config_format="mistral",
+        # load_format="mistral",
         # tensor_parallel_size=2, # TODO: add this back in once have 2 GPUs
         kv_transfer_config=ktc,
-        max_model_len=20000,    # TODO: change this to 128000 once hosting devstral
+        max_model_len=12800,    # TODO: change this to 128000 once hosting devstral
         gpu_memory_utilization=0.8,
         enable_prefix_caching=False,
     )
-    
-    # # mistralai/Mistral-7B-Instruct-v0.2 args
-    # llm_args = EngineArgs(
-    #     model=model,
-    #     tokenizer_mode="mistral",
-    #     kv_transfer_config=ktc,
-    #     max_model_len=32000,
-    #     gpu_memory_utilization=0.8,
-    #     enable_prefix_caching=False,
-    # )
 
     llm = LLM(**asdict(llm_args))
     try:
@@ -134,11 +117,8 @@ class BlendServer:
         # Setup environment variables
         setup_environment_variables(use_disk, blend_special_str)
         
-        # Load system prompt for Devstral
-        self.system_prompt = self.load_system_prompt(model, "SYSTEM_PROMPT.txt")
-        
-        # Initialize Devstral tokenizer
-        self.tokenizer = MistralTokenizer.from_hf_hub(model)
+        # Initialize tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model)
         
         # Initialize LLM with LMCache
         self.llm_context = build_llm_with_lmcache(self.lmcache_connector, model)
@@ -147,18 +127,6 @@ class BlendServer:
         # Create FastAPI app
         self.app = FastAPI(title="LMCache Blend Server", version="1.0.0")
         self.setup_routes()
-    
-    def load_system_prompt(self, repo_id: str, filename: str) -> str:
-        """Load system prompt from HuggingFace hub"""
-        # try:
-        #     file_path = hf_hub_download(repo_id=repo_id, filename=filename)
-        #     with open(file_path, "r") as file:
-        #         system_prompt = file.read()
-        #     print(f"Loaded system prompt: {system_prompt}")
-        #     return system_prompt
-        # except Exception as e:
-        #     print(f"Warning: Could not load system prompt from {repo_id}/{filename}: {e}")
-        return "You are a very helpful assistant."
     
     def setup_routes(self):
         """Setup API routes"""
@@ -171,25 +139,41 @@ class BlendServer:
             return {"status": "healthy", "model": self.model}
     
     def messages_to_prompt(self, messages: List[ChatMessage]) -> List[int]:
-        """Convert chat messages to tokenized prompt using Devstral tokenizer"""
-        # Convert our ChatMessage format to Mistral format
-        mistral_messages = []
+        """Convert chat messages to tokenized prompt with blending"""
+        prompt_tokens = []
         
-        for message in messages:
+        for i, message in enumerate(messages):
             if message.role == "system":
-                mistral_messages.append(SystemMessage(content=message.content))
+                # Encode system message
+                system_tokens = self.tokenizer.encode(message.content)
+                prompt_tokens.extend(system_tokens)
+                
+                # Add blend separator if not the last message
+                if i < len(messages) - 1:
+                    blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
+                    prompt_tokens.extend(blend_tokens)
+            
             elif message.role == "user":
-                mistral_messages.append(UserMessage(content=message.content))
+                # Encode user message
+                user_tokens = self.tokenizer.encode(message.content)[1:]  # Remove BOS token
+                prompt_tokens.extend(user_tokens)
+                
+                # Add blend separator if not the last message
+                if i < len(messages) - 1:
+                    blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
+                    prompt_tokens.extend(blend_tokens)
+            
             elif message.role == "assistant":
-                mistral_messages.append(AssistantMessage(content=message.content))
+                # Encode assistant message
+                assistant_tokens = self.tokenizer.encode(message.content)[1:]  # Remove BOS token
+                prompt_tokens.extend(assistant_tokens)
+                
+                # Add blend separator if not the last message
+                if i < len(messages) - 1:
+                    blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
+                    prompt_tokens.extend(blend_tokens)
         
-        # Create Mistral chat completion request
-        mistral_request = MistralChatCompletionRequest(messages=mistral_messages)
-        
-        # Tokenize using Devstral tokenizer
-        tokenized = self.tokenizer.encode_chat_completion(mistral_request)
-        
-        return tokenized.tokens
+        return prompt_tokens
     
     async def handle_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request"""
@@ -201,7 +185,7 @@ class BlendServer:
             sampling_params = SamplingParams(
                 temperature=request.temperature,
                 top_p=request.top_p,
-                n=request.n,
+                # n=request.n,      # TODO: add this back in once using Devstral
                 max_tokens=request.max_tokens
             )
             
@@ -209,7 +193,7 @@ class BlendServer:
             start_time = time.time()
             outputs = self.llm.generate(
                 prompt_token_ids=prompt_tokens, 
-                sampling_params=sampling_params,
+                sampling_params=sampling_params
             )
             end_time = time.time()
             
@@ -218,8 +202,6 @@ class BlendServer:
             
             # Calculate usage
             input_tokens = len(prompt_tokens)
-            # For Devstral, we need to decode the generated text properly
-            # The generated text is already decoded from vLLM, so we just count tokens
             output_tokens = len(self.tokenizer.encode(generated_text))
             
             # Create response
@@ -261,8 +243,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LMCache Blend Server")
     parser.add_argument(
         "--model",
-        # default="mistralai/Mistral-7B-Instruct-v0.2",
-        default="mistralai/Devstral-Small-2507",
+        default="mistralai/Mistral-7B-Instruct-v0.2",
+        # default="mistralai/Devstral-Small-2507",
         help="Model to use for inference"
     )
     parser.add_argument(
@@ -295,17 +277,17 @@ def parse_args():
 def main():
     args = parse_args()
     
+    print(f"Starting LMCache Blend Server on {args.host}:{args.port}")
+    print(f"Model: {args.model}")
+    print(f"Use disk: {args.use_disk}")
+    print(f"Blend special string: {args.blend_special_str}")
+    
     # Create and run server
     server = BlendServer(
         model=args.model,
         use_disk=args.use_disk,
         blend_special_str=args.blend_special_str
     )
-    
-    print(f"Starting LMCache Blend Server on {args.host}:{args.port}")
-    print(f"Model: {args.model}")
-    print(f"Use disk: {args.use_disk}")
-    print(f"Blend special string: {args.blend_special_str}")
     
     server.run(host=args.host, port=args.port)
 

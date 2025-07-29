@@ -1298,6 +1298,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         """
         :param int size: The size of the pinned memory in bytes.
         """
+        print(f"[LMCache] Initializing MixedMemoryAllocator with size: {size}")
         buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
 
         if use_paging:
