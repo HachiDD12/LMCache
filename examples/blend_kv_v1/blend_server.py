@@ -99,10 +99,10 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         tokenizer_mode="mistral",
         config_format="mistral",
         load_format="mistral",
-        # tensor_parallel_size=2, # TODO: add this back in once have 2 GPUs
+        tensor_parallel_size=4, # TODO: add this back in once have 2 GPUs
         kv_transfer_config=ktc,
-        max_model_len=20000,    # TODO: change this to 128000 once hosting devstral
-        gpu_memory_utilization=0.8,
+        max_model_len=128000,    # TODO: change this to 128000 once hosting devstral
+        gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
     )
     
@@ -193,6 +193,7 @@ class BlendServer:
     
     async def handle_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request"""
+        print(f"@@@@@ Handling chat completion request of n = {request.n}")
         try:
             # Convert messages to tokenized prompt
             prompt_tokens = self.messages_to_prompt(request.messages)
@@ -212,29 +213,36 @@ class BlendServer:
                 sampling_params=sampling_params,
             )
             end_time = time.time()
-            
+            print(f"[INFO] Generation time: {end_time - start_time} seconds")
             # Extract generated text
-            generated_text = outputs[0].outputs[0].text
             
+            # print(f"@@@@@ Outputs: {outputs}")
+            # print(f"@@@@@ Outputs[0]: {outputs[0]}")
+            
+            choices = []
+            for i, completion in enumerate(outputs[0].outputs):
+                choices.append({
+                    "index": i,
+                    "message": {
+                        "role": "assistant",
+                        "content": completion.text
+                    },
+                    "finish_reason": "stop"
+                })
+                
             # Calculate usage
             input_tokens = len(prompt_tokens)
             # For Devstral, we need to decode the generated text properly
             # The generated text is already decoded from vLLM, so we just count tokens
-            output_tokens = len(self.tokenizer.encode(generated_text))
+            # output_tokens = len(self.tokenizer.encode_chat_completion(generated_text))
+            output_tokens = sum(len(completion.text) for completion in outputs[0].outputs)
             
             # Create response
             response = ChatCompletionResponse(
                 id=f"chatcmpl-{int(time.time())}",
                 created=int(time.time()),
                 model=request.model,
-                choices=[{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": generated_text
-                    },
-                    "finish_reason": "stop"
-                }],
+                choices=choices,
                 usage={
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
@@ -242,9 +250,12 @@ class BlendServer:
                 }
             )
             
+            print(f"@@@@@ Response # of choices: {len(choices)}")
+            
             return response
             
         except Exception as e:
+            print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
     
     def run(self, host: str = "0.0.0.0", port: int = 8000):
