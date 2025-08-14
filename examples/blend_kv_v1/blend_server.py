@@ -191,12 +191,40 @@ class BlendServer:
         
         return tokenized.tokens
     
+    def messages_to_prompt_blend(self, messages: List[ChatMessage]) -> List[int]:
+        """Convert chat messages to tokenized prompt using Devstral tokenizer as well as default Tekkenizer
+        for the blend special string, such that each message is a separate blend chunk.
+        """
+        # Convert our ChatMessage format to Mistral format
+        for message in messages:
+            mistral_messages = []
+            prompt_tokens = []
+            if message.role == "system":
+                mistral_messages.append(SystemMessage(content=message.content))
+            elif message.role == "user":
+                mistral_messages.append(UserMessage(content=message.content))
+            elif message.role == "assistant":
+                mistral_messages.append(AssistantMessage(content=message.content))
+        
+            # Create Mistral chat completion request
+            mistral_request = MistralChatCompletionRequest(messages=mistral_messages)
+
+            # Tokenize using Devstral tokenizer
+            msg_tokens = self.tokenizer.encode_chat_completion(mistral_request).tokens
+            prompt_tokens.extend(msg_tokens if prompt_tokens == [] else msg_tokens[1:])
+        
+            # Add blend special string
+            blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
+            prompt_tokens.extend(blend_tokens)
+        
+        return prompt_tokens
+    
     async def handle_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request"""
         print(f"@@@@@ Handling chat completion request of n = {request.n}")
         try:
             # Convert messages to tokenized prompt
-            prompt_tokens = self.messages_to_prompt(request.messages)
+            prompt_tokens = self.messages_to_prompt_blend(request.messages)
             
             # Create sampling parameters
             sampling_params = SamplingParams(
