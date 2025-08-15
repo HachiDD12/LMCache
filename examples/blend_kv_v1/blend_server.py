@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import time
+import signal
 from typing import List, Optional
 
 # Third Party
@@ -211,13 +212,16 @@ class BlendServer:
 
             # Tokenize using Devstral tokenizer
             msg_tokens = self.tokenizer.encode_chat_completion(mistral_request).tokens
-            prompt_tokens.extend(msg_tokens if prompt_tokens == [] else msg_tokens[1:])
+            prompt_tokens.extend(msg_tokens)
         
             # Add blend special string
-            blend_tokens = self.tokenizer.encode(self.blend_special_str)[1:]
+            blend_tokens = self.tokenizer.instruct_tokenizer.tokenizer.encode(self.blend_special_str, bos=False, eos=False)
             prompt_tokens.extend(blend_tokens)
         
         return prompt_tokens
+    
+    def handle_timeout(self, signum, frame):
+        raise Exception("Generation timed out")
     
     async def handle_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request"""
@@ -235,13 +239,16 @@ class BlendServer:
             )
             
             # Generate response
+            signal.signal(signal.SIGALRM, self.handle_timeout)
+            signal.alarm(300)
             start_time = time.time()
             outputs = self.llm.generate(
                 prompt_token_ids=prompt_tokens, 
                 sampling_params=sampling_params,
             )
             end_time = time.time()
-            print(f"[INFO] Generation time: {end_time - start_time} seconds")
+            signal.alarm(0)
+            print(f"[INFO] Generation time: {end_time - start_time} seconds for {len(prompt_tokens)} tokens")
             # Extract generated text
             
             # print(f"@@@@@ Outputs: {outputs}")
@@ -283,6 +290,7 @@ class BlendServer:
             return response
             
         except Exception as e:
+            signal.alarm(0)
             print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
     
