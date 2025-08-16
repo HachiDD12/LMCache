@@ -19,6 +19,7 @@ import abc
 # Third Party
 from transformers import AutoTokenizer
 import torch
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
@@ -27,6 +28,7 @@ from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 
 logger = init_logger(__name__)
+HACHIS_USING_DEVSTRAL = True
 
 try:
     # Third Party
@@ -228,6 +230,18 @@ class SegmentTokenDatabase(TokenDatabase):
     """
 
     def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
+        if (HACHIS_USING_DEVSTRAL):
+            # temp fix for devstral, this need to be better handled later if using other models
+            logger.debug(f"Temp fix using Devstral Tekkenizer\nmetadata model name: {metadata.model_name}")
+            self.tokenizer = MistralTokenizer.from_hf_hub("mistralai/Devstral-Small-2507") 
+            self.hash_func = hash  
+            self.sep_tokens = self.tokenizer.instruct_tokenizer.tokenizer.encode(
+                config.blend_special_str, bos=False, eos=False)
+            self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
+            self.sep_len = len(self.sep_tokens)
+            self.metadata = metadata
+            return
+        
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
 
         # FIXME(Jiayi): cache_config.prefix_caching_hash_algo
