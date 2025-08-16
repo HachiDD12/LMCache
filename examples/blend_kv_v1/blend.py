@@ -73,9 +73,9 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         tokenizer_mode="mistral",
         config_format="mistral",
         load_format="mistral",
-        tensor_parallel_size=4,
+        tensor_parallel_size=2, # 4 GPUs, change based on resource availability
         kv_transfer_config=ktc,
-        max_model_len=128000,
+        max_model_len=64000,
         gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
     )
