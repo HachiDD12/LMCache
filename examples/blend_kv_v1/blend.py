@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import asdict
 import argparse
@@ -11,6 +10,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -57,14 +57,27 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         kv_role="kv_both",
     )
 
+    # for mistral 7b instruct
+    # llm_args = EngineArgs(
+    #     model=model,
+    #     tokenizer_mode="mistral",
+    #     kv_transfer_config=ktc,
+    #     max_model_len=8000,
+    #     gpu_memory_utilization=0.8,
+    #     enable_prefix_caching=False,
+    # )
+    
+    # for devstral small
     llm_args = EngineArgs(
         model=model,
         tokenizer_mode="mistral",
+        config_format="mistral",
+        load_format="mistral",
+        tensor_parallel_size=4,
         kv_transfer_config=ktc,
-        max_model_len=32648,
-        gpu_memory_utilization=0.8,
+        max_model_len=128000,
+        gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
-        enforce_eager=True,
     )
 
     llm = LLM(**asdict(llm_args))
@@ -110,78 +123,94 @@ def parse_args():
 
     return parser.parse_args()
 
+def test_mistral7b_tokenizer(tokenizer, blend_special_str):
+    print(f"### Testing mistral7b tokenizer ###")
+    chunk1_prompt = tokenizer.encode("Hello, how are you?")
+    chunk2_prompt = tokenizer.encode("Hello, what's up?")
+    blend_special_str_toks = tokenizer.encode(blend_special_str)
+    combined_prompt = tokenizer.encode(f"Hello, how are you?{blend_special_str}Hello, what's up?")
+    if chunk1_prompt + blend_special_str_toks + chunk2_prompt == combined_prompt:
+        print("chunk1_prompt + blend_special_str_toks + chunk2_prompt == combined_prompt")
+        print(f"combined_prompt: {combined_prompt}")
+        print(f"blend_special_str: {blend_special_str} -> {blend_special_str_toks}")
+    else:
+        print("chunk1_prompt + blend_special_str_toks + chunk2_prompt != combined_prompt")
+        print(f"LHS: {chunk1_prompt + blend_special_str_toks + chunk2_prompt}")
+        print(f"RHS: {combined_prompt}")
+        print(f"blend_special_str: {blend_special_str} -> {blend_special_str_toks}")
+    print("-" * 50)
 
 def main():
     args = parse_args()
 
     lmcache_connector = "LMCacheConnectorV1"
-    model = "mistralai/Mistral-7B-Instruct-v0.2"
+    model = "mistralai/Devstral-Small-2507"
+    model2 = "mistralai/Mistral-7B-Instruct-v0.2" # only for testing tokenizer
 
     setup_environment_variables(args.use_disk, args.blend_special_str)
+    blend_special_str = os.getenv("LMCACHE_BLEND_SPECIAL_STR")
 
-    tokenizer = AutoTokenizer.from_pretrained(model)
+    mistral_tokenizer = MistralTokenizer.from_hf_hub(model)
+    tokenizer = mistral_tokenizer.instruct_tokenizer.tokenizer
+    # test_mistral7b_tokenizer(AutoTokenizer.from_pretrained(model2), blend_special_str)
 
     with build_llm_with_lmcache(lmcache_connector, model) as llm:
+        # This example script runs two requests with a shared prefix.
         # Define the shared prompt and specific prompts
-        warmup_prompt = tokenizer.encode("Nice to meet you" * 500)[1:]
-        sys_prompt = tokenizer.encode("You are a very helpful assistant.")
-        chunk1_prompt = tokenizer.encode("Hello, how are you?" * 500)[1:]
-        chunk2_prompt = tokenizer.encode("Hello, what's up?" * 500)[1:]
-        chunk3_prompt = tokenizer.encode("Hi, what are you up to?" * 500)[1:]
-        blend_special_str = tokenizer.encode(os.getenv("LMCACHE_BLEND_SPECIAL_STR"))[1:]
+        sys_prompt = tokenizer.encode("You are a very helpful assistant.", bos=True, eos=False)
+        chunk1_prompt = tokenizer.encode("Hello, how are you?" * 500, bos=False, eos=False)
+        chunk2_prompt = tokenizer.encode("Hello, what's up?" * 500, bos=False, eos=False)
+        blend_special_str_toks = tokenizer.encode(blend_special_str, bos=False, eos=False)
+        
+        # print(f"### Testing devstral tokenizer ###")
+        # combined_prompt = tokenizer.encode(f"Hello, how are you?{blend_special_str}Hello, what's up?", bos=False, eos=False)
+        # if chunk1_prompt + blend_special_str_toks + chunk2_prompt == combined_prompt:
+        #     print("chunk1_prompt + blend_special_str_toks + chunk2_prompt == combined_prompt")
+        #     print(f"combined_prompt: {combined_prompt}")
+        #     print(f"blend_special_str: {blend_special_str} -> {blend_special_str_toks}")
+        # else:
+        #     print("chunk1_prompt + blend_special_str_toks + chunk2_prompt != combined_prompt")
+        #     print(f"LHS: {chunk1_prompt + blend_special_str_toks + chunk2_prompt}")
+        #     print(f"RHS: {combined_prompt}")
+        #     print(f"blend_special_str: {blend_special_str} -> {blend_special_str_toks}")
+        # print(f"blendspecialstr with bos and eos: {tokenizer.encode(blend_special_str, bos=True, eos=True)}")
+        # print("-" * 50)
+        
+        print(f"### Prompting devstral ###")
         first_prompt = (
             sys_prompt
-            + blend_special_str
+            + blend_special_str_toks
             + chunk1_prompt
-            + blend_special_str
+            + blend_special_str_toks
             + chunk2_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, my name is")[1:]
+            + blend_special_str_toks
+            + tokenizer.encode("Hello, my name is", bos=False, eos=True)
         )
 
         second_prompt = (
             sys_prompt
-            + blend_special_str
+            + blend_special_str_toks
             + chunk2_prompt
-            + blend_special_str
+            + blend_special_str_toks
             + chunk1_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, how are you?")[1:]
+            + blend_special_str_toks
+            + tokenizer.encode("Hello, how are you?", bos=False, eos=True)
+        )
+        third_prompt = (
+            sys_prompt
+            + blend_special_str_toks
+            + chunk1_prompt
+            + blend_special_str_toks
+            + chunk1_prompt
+            + blend_special_str_toks
+            + chunk1_prompt
+            + blend_special_str_toks
+            + chunk2_prompt
+            + blend_special_str_toks
+            + tokenizer.encode("Hello, my name is", bos=False, eos=True)
         )
         
-        third_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, my name is")[1:]
-        )
-
-        third_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, what's up?")[1:]
-        )
-
-        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
-
-        print_output(llm, warmup_prompt, sampling_params, "warmup")
+        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=10)
 
         # Print the first output
         print_output(llm, first_prompt, sampling_params, "first")
@@ -189,14 +218,7 @@ def main():
         time.sleep(1)
 
         # print the second output
-        print_output(
-            llm, second_prompt, sampling_params, "second (warming up blend code path)"
-        )
-
-        time.sleep(1)
-
-        # print the third output
-        print_output(llm, third_prompt, sampling_params, "third")
+        print_output(llm, second_prompt, sampling_params, "second")
 
         time.sleep(1)
 
