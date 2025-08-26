@@ -6,6 +6,7 @@ import os
 import time
 import signal
 from typing import List, Optional
+from datetime import datetime
 
 # Third Party
 from fastapi import FastAPI, HTTPException, Request
@@ -126,11 +127,12 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
 
 
 class BlendServer:
-    def __init__(self, model: str, use_disk: bool = False, blend_special_str: str = " # # "):
+    def __init__(self, model: str, use_disk: bool = False, blend_special_str: str = " # # ", log_file: str = "chat_requests.json"):
         self.model = model
         self.use_disk = use_disk
         self.blend_special_str = blend_special_str
         self.lmcache_connector = "LMCacheConnectorV1"
+        self.log_file = log_file
         
         # Setup environment variables
         setup_environment_variables(use_disk, blend_special_str)
@@ -140,6 +142,7 @@ class BlendServer:
         
         # Initialize Devstral tokenizer
         self.tokenizer = MistralTokenizer.from_hf_hub(model)
+        self.tekkenizer = self.tokenizer.instruct_tokenizer.tokenizer
         
         # Initialize LLM with LMCache
         self.llm_context = build_llm_with_lmcache(self.lmcache_connector, model)
@@ -148,6 +151,47 @@ class BlendServer:
         # Create FastAPI app
         self.app = FastAPI(title="LMCache Blend Server", version="1.0.0")
         self.setup_routes()
+    
+    def log_request(self, request: ChatCompletionRequest, response: ChatCompletionResponse, generation_time: float):
+        """Log the request and response to the JSON file"""
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "request": {
+                "model": request.model,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
+                "temperature": request.temperature,
+                "top_p": request.top_p,
+                "n": request.n,
+                "max_tokens": request.max_tokens,
+                "tools": request.tools
+            },
+            "response": {
+                "id": response.id,
+                "choices": response.choices,
+                "usage": response.usage
+            },
+            "generation_time": generation_time
+        }
+        
+        try:
+            # Load existing logs if file exists
+            logs = []
+            if os.path.exists(self.log_file):
+                try:
+                    with open(self.log_file, 'r') as f:
+                        logs = json.load(f)
+                except (json.JSONDecodeError, FileNotFoundError):
+                    logs = []
+            
+            # Append new log entry
+            logs.append(log_entry)
+            
+            # Write back to file
+            with open(self.log_file, 'w') as f:
+                json.dump(logs, f, indent=2)
+                
+        except Exception as e:
+            print(f"[WARNING] Failed to log request: {e}")
     
     def load_system_prompt(self, repo_id: str, filename: str) -> str:
         """Load system prompt from HuggingFace hub"""
@@ -190,16 +234,20 @@ class BlendServer:
         # Tokenize using Devstral tokenizer
         tokenized = self.tokenizer.encode_chat_completion(mistral_request)
         
+        # print(f"@@@@@ Prompt tokens naive: {tokenized.tokens}")
         return tokenized.tokens
     
-    def messages_to_prompt_blend(self, messages: List[ChatMessage]) -> List[int]:
+    def messages_to_prompt_blend_by_msg(self, messages: List[ChatMessage]) -> List[int]:
         """Convert chat messages to tokenized prompt using Devstral tokenizer as well as default Tekkenizer
         for the blend special string, such that each message is a separate blend chunk.
         """
+        # Pre-encode the blend special string
+        blend_tokens = self.tokenizer.instruct_tokenizer.tokenizer.encode(self.blend_special_str, bos=False, eos=False)
+        
         # Convert our ChatMessage format to Mistral format
+        prompt_tokens = []
         for message in messages:
             mistral_messages = []
-            prompt_tokens = []
             if message.role == "system":
                 mistral_messages.append(SystemMessage(content=message.content))
             elif message.role == "user":
@@ -215,10 +263,56 @@ class BlendServer:
             prompt_tokens.extend(msg_tokens)
         
             # Add blend special string
-            blend_tokens = self.tokenizer.instruct_tokenizer.tokenizer.encode(self.blend_special_str, bos=False, eos=False)
             prompt_tokens.extend(blend_tokens)
         
-        return prompt_tokens
+        # print(f"@@@@@ Prompt tokens blend by msg: {prompt_tokens[:-len(blend_tokens)]}")
+        return prompt_tokens[:-len(blend_tokens)]
+    
+    def get_stitched_tokens_for_msg_content(self, msg_content: str, blend_tokens: List[int]) -> List[int]:
+        """Get stitched tokens for a single message content"""
+        tokens = []
+        # split on blend special string
+        msg_chunks = msg_content.split(self.blend_special_str)
+        for chunk in msg_chunks:
+            tokens.extend(self.tekkenizer.encode(chunk, bos=False, eos=False))
+            tokens.extend(blend_tokens)
+        return tokens[:-len(blend_tokens)]
+    
+    def messages_to_prompt_blend_by_chunk(self, messages: List[ChatMessage]) -> List[int]:
+        """Convert chat messages to tokenized prompt using Devstral tokenizer as well as default Tekkenizer.
+        Extracts chunks by splitting on the blend special string, tokenizes each chunk, and then 
+        stitches them back together with the blend special string.
+        """
+        # Pre-encode the blend special string
+        blend_tokens = self.tekkenizer.encode(self.blend_special_str, bos=False, eos=False)
+        dummy_tokens = self.tekkenizer.encode(" ", bos=True, eos=True)
+        bos, eos = dummy_tokens[0], dummy_tokens[-1]
+        # print(f"@@@@@ Blend tokens: {blend_tokens}")
+        
+        # encode each message chunk separately then stitch
+        prompt_tokens = [bos]
+        for message in messages:
+            # TODO: add role to the tokens (see mistral control tokens)
+            if message.role == "system":
+                msg_tokens = self.get_stitched_tokens_for_msg_content(message.content, blend_tokens)
+            elif message.role == "user":
+                msg_tokens = self.get_stitched_tokens_for_msg_content(message.content, blend_tokens)
+            elif message.role == "assistant":
+                msg_tokens = self.get_stitched_tokens_for_msg_content(message.content, blend_tokens)
+        
+            # Create Mistral chat completion request
+            # mistral_request = MistralChatCompletionRequest(messages=mistral_messages)
+
+            # Tokenize using Devstral tokenizer
+            # msg_tokens = self.tokenizer.encode_chat_completion(mistral_request).tokens
+            prompt_tokens.extend(msg_tokens)
+        
+            # Add blend special string
+            prompt_tokens.extend(blend_tokens)
+
+        res = prompt_tokens[:-len(blend_tokens)] + [eos]
+        # print(f"@@@@@ Prompt tokens blend by chunk: {res}")
+        return res
     
     def handle_timeout(self, signum, frame):
         raise Exception("Generation timed out")
@@ -228,7 +322,8 @@ class BlendServer:
         print(f"@@@@@ Handling chat completion request of n = {request.n}")
         try:
             # Convert messages to tokenized prompt
-            prompt_tokens = self.messages_to_prompt_blend(request.messages)
+            # prompt_tokens = self.messages_to_prompt_blend_by_msg(request.messages)
+            prompt_tokens = self.messages_to_prompt_blend_by_chunk(request.messages)
             
             # Create sampling parameters
             sampling_params = SamplingParams(
@@ -247,8 +342,9 @@ class BlendServer:
                 sampling_params=sampling_params,
             )
             end_time = time.time()
+            generation_time = end_time - start_time
             signal.alarm(0)
-            print(f"[INFO] Generation time: {end_time - start_time} seconds for {len(prompt_tokens)} tokens")
+            print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
             # Extract generated text
             
             # print(f"@@@@@ Outputs: {outputs}")
@@ -287,12 +383,177 @@ class BlendServer:
             
             print(f"@@@@@ Response # of choices: {len(choices)}")
             
+            # Log the request and response
+            self.log_request(request, response, generation_time)
+            
             return response
             
         except Exception as e:
             signal.alarm(0)
             print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+    
+    def load_mock_requests(self, mock_file: str) -> List[dict]:
+        """Load mock requests from a JSON log file"""
+        try:
+            with open(mock_file, 'r') as f:
+                logs = json.load(f)
+            
+            # Extract requests from logs
+            requests = []
+            for log_entry in logs:
+                if 'request' in log_entry:
+                    # Convert back to ChatCompletionRequest format
+                    request_data = log_entry['request']
+                    messages = [ChatMessage(role=msg['role'], content=msg['content']) 
+                              for msg in request_data.get('messages', [])]
+                    
+                    mock_request = {
+                        'request': ChatCompletionRequest(
+                            model=request_data.get('model', self.model),
+                            messages=messages,
+                            temperature=request_data.get('temperature', 0.7),
+                            top_p=request_data.get('top_p', 0.95),
+                            n=request_data.get('n', 1),
+                            max_tokens=request_data.get('max_tokens', 100),
+                            tools=request_data.get('tools')
+                        ),
+                        'original_timestamp': log_entry.get('timestamp'),
+                        'original_generation_time': log_entry.get('generation_time')
+                    }
+                    requests.append(mock_request)
+            
+            print(f"[MOCK] Loaded {len(requests)} requests from {mock_file}")
+            return requests
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to load mock requests from {mock_file}: {e}")
+            return []
+    
+    def run_mock_experiment(self, mock_file: str):
+        """Run a mock experiment by replaying requests from the log file"""
+        print(f"[MOCK] Starting mock experiment with file: {mock_file}")
+        
+        # Load mock requests
+        mock_requests = self.load_mock_requests(mock_file)
+        if not mock_requests:
+            print("[MOCK] No valid requests found, exiting mock mode")
+            return
+        
+        # Sort by original timestamp if available
+        mock_requests.sort(key=lambda x: x.get('original_timestamp', ''))
+        
+        print(f"[MOCK] Replaying {len(mock_requests)} requests...")
+        
+        total_original_time = 0
+        total_mock_time = 0
+        successful_requests = 0
+        
+        for i, mock_data in enumerate(mock_requests):
+            request = mock_data['request']
+            original_time = mock_data.get('original_generation_time', 0)
+            original_timestamp = mock_data.get('original_timestamp', 'unknown')
+            
+            print(f"[MOCK] Processing request {i+1}/{len(mock_requests)} (original: {original_timestamp})")
+            print(f"[MOCK] Request: {len(request.messages)} messages, max_tokens: {request.max_tokens}")
+            
+            try:
+                # Process the request
+                start_time = time.time()
+                response = self.handle_chat_completion_sync(request)
+                end_time = time.time()
+                
+                mock_time = end_time - start_time
+                total_mock_time += mock_time
+                total_original_time += original_time
+                successful_requests += 1
+                
+                print(f"[MOCK] Request {i+1} completed:")
+                print(f"  Original time: {original_time:.2f}s")
+                print(f"  Mock time: {mock_time:.2f}s")
+                print(f"  Speedup: {original_time/mock_time:.2f}x" if mock_time > 0 else "  Speedup: N/A")
+                print(f"  Response tokens: {response.usage['completion_tokens']}")
+                
+            except Exception as e:
+                print(f"[MOCK] Request {i+1} failed: {e}")
+        
+        # Print summary
+        print(f"\n[MOCK] Experiment Summary:")
+        print(f"  Total requests: {len(mock_requests)}")
+        print(f"  Successful: {successful_requests}")
+        print(f"  Failed: {len(mock_requests) - successful_requests}")
+        if successful_requests > 0:
+            print(f"  Average original time: {total_original_time/successful_requests:.2f}s")
+            print(f"  Average mock time: {total_mock_time/successful_requests:.2f}s")
+            if total_mock_time > 0:
+                print(f"  Overall speedup: {total_original_time/total_mock_time:.2f}x")
+    
+    def handle_chat_completion_sync(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        """Synchronous version of handle_chat_completion for mock mode"""
+        print(f"@@@@@ Handling chat completion request of n = {request.n}")
+        try:
+            # Convert messages to tokenized prompt
+            # self.messages_to_prompt(request.messages)
+            # self.messages_to_prompt_blend_by_msg(request.messages)
+            prompt_tokens = self.messages_to_prompt_blend_by_chunk(request.messages)
+            
+            # Create sampling parameters
+            sampling_params = SamplingParams(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                n=request.n,
+                max_tokens=request.max_tokens
+            )
+            
+            # Generate response
+            signal.signal(signal.SIGALRM, self.handle_timeout)
+            signal.alarm(300)
+            start_time = time.time()
+            outputs = self.llm.generate(
+                prompt_token_ids=prompt_tokens, 
+                sampling_params=sampling_params,
+            )
+            end_time = time.time()
+            generation_time = end_time - start_time
+            signal.alarm(0)
+            print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
+            # print(f"[INFO] Outputs: {outputs[0].outputs}")
+            choices = []
+            for i, completion in enumerate(outputs[0].outputs):
+                choices.append({
+                    "index": i,
+                    "message": {
+                        "role": "assistant",
+                        "content": completion.text
+                    },
+                    "finish_reason": "stop"
+                })
+                
+            # Calculate usage
+            input_tokens = len(prompt_tokens)
+            output_tokens = sum(len(completion.text) for completion in outputs[0].outputs)
+            
+            # Create response
+            response = ChatCompletionResponse(
+                id=f"chatcmpl-{int(time.time())}",
+                created=int(time.time()),
+                model=request.model,
+                choices=choices,
+                usage={
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens
+                }
+            )
+            
+            print(f"@@@@@ Response # of choices: {len(choices)}")
+            
+            return response
+            
+        except Exception as e:
+            signal.alarm(0)
+            print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
+            raise e
     
     def run(self, host: str = "0.0.0.0", port: int = 8000):
         """Run the server"""
@@ -335,6 +596,20 @@ def parse_args():
         default="# #",
         help="Special separator for blending chunks"
     )
+    parser.add_argument(
+        "--log-file",
+        default="~/chat_requests.json",
+        help="Path to the JSON log file for request logging"
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Enable mock mode to replay requests from log file"
+    )
+    parser.add_argument(
+        "--mock-file",
+        help="Path to the JSON log file to replay in mock mode (required if --mock is set)"
+    )
     
     return parser.parse_args()
 
@@ -342,19 +617,30 @@ def parse_args():
 def main():
     args = parse_args()
     
+    # Validate mock mode arguments
+    if args.mock and not args.mock_file:
+        print("Error: --mock flag requires --mock-file to be specified")
+        return
+    
     # Create and run server
     server = BlendServer(
         model=args.model,
         use_disk=args.use_disk,
-        blend_special_str=args.blend_special_str
+        blend_special_str=args.blend_special_str,
+        log_file=args.log_file
     )
     
     print(f"Starting LMCache Blend Server on {args.host}:{args.port}")
     print(f"Model: {args.model}")
     print(f"Use disk: {args.use_disk}")
     print(f"Blend special string: {args.blend_special_str}")
+    print(f"Request log file: {args.log_file}")
     
-    server.run(host=args.host, port=args.port)
+    if args.mock:
+        print(f"Mock mode enabled - replaying requests from: {args.mock_file}")
+        server.run_mock_experiment(args.mock_file)
+    else:
+        server.run(host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

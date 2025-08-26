@@ -1,0 +1,49 @@
+Using Python 3.12.11 environment at: Cacheblend/.venv
+Audited 3 packages in 32ms
+LMCache Performance Analysis
+========================================
+Error log: /home/zhuofanc/lmcache.err
+Output log: /home/zhuofanc/lmcache.out
+
+Extracted cache data for 246 requests from /home/zhuofanc/lmcache.err
+Extracted speedup data for 246 requests from /home/zhuofanc/lmcache.out
+Found 246 matching request IDs
+Request 0: Total=4957, Hit=0, Ratio=0.000, Speedup=1.36x
+Request 1: Total=6382, Hit=7, Ratio=0.001, Speedup=0.48x
+Request 2: Total=3497, Hit=7, Ratio=0.002, Speedup=0.88x
+Request 3: Total=5190, Hit=46, Ratio=0.009, Speedup=1.04x
+Request 4: Total=2091, Hit=485, Ratio=0.232, Speedup=1.19x
+Request 224: Total=785, Hit=32, Ratio=0.041, Speedup=9.95x
+Request 225: Total=785, Hit=785, Ratio=1.000, Speedup=1.14x
+
+Data Summary:
+--------------------
+Total correlated requests: 246
+Average hit ratio: 0.216
+Average speedup: 1.13x
+Median hit ratio: 0.034
+Median speedup: 0.99x
+Max speedup: 9.95x
+Min speedup: 0.10x
+Max hit ratio: 1.000
+Min hit ratio: 0.000
+Average total tokens: 8965
+Median total tokens: 4414
+Average hit tokens: 764
+
+Correlation Coefficients:
+Hit ratio vs Speedup: -0.110
+Total tokens vs Speedup: -0.005
+Hit tokens vs Speedup: -0.094
+Hit ratio vs Total tokens: -0.265
+Plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/hit_ratio_vs_speedup.png
+Total tokens plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/total_tokens_vs_speedup.png
+Hit tokens plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/hit_tokens_vs_speedup.png
+Hit ratio vs total tokens plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/hit_ratio_vs_total_tokens.png
+Hit ratio histogram saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/hit_ratio_histogram.png
+Hit tokens histogram saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/hit_tokens_histogram.png
+Speedup histogram saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/speedup_histogram.png
+All plots saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals
+
+Data saved to cache_performance_data.csv for further analysis
+Run completed at: Tue Aug 26 17:57:26 EDT 2025
