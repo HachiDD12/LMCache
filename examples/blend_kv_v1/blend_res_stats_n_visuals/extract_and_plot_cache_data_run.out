@@ -1,6 +1,6 @@
 Using Python 3.12.11 environment at: Cacheblend/.venv
-Audited 3 packages in 32ms
-LMCache Performance Analysis
+Audited 3 packages in 570ms
+Performance Analysis
 ========================================
 Error log: /home/zhuofanc/lmcache.err
 Output log: /home/zhuofanc/lmcache.out
@@ -46,4 +46,4 @@ Speedup histogram saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v
 All plots saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals
 
 Data saved to cache_performance_data.csv for further analysis
-Run completed at: Tue Aug 26 17:57:26 EDT 2025
+Run completed at: Wed Aug 27 00:55:21 EDT 2025
