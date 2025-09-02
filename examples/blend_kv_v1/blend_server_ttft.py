@@ -1,10 +1,12 @@
 # Standard
 import argparse
+import asyncio
 import contextlib
 import json
 import os
 import time
 import signal
+import uuid
 from typing import List, Optional
 from datetime import datetime
 
@@ -13,9 +15,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams, AsyncLLMEngine
 from vllm.config import KVTransferConfig
-from vllm.engine.arg_utils import EngineArgs
+from vllm.inputs import TokensPrompt
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.sampling_params import RequestOutputKind
 from dataclasses import asdict
 import uvicorn
 import torch
@@ -96,29 +100,21 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     )
     
     # --tokenizer_mode mistral --config_format mistral --load_format mistral --tool-call-parser mistral --enable-auto-tool-choice --tensor-parallel-size 2
-    llm_args = EngineArgs(
+    llm_args = AsyncEngineArgs(
         model=model,
         tokenizer_mode="mistral",
         config_format="mistral",
         load_format="mistral",
-        tensor_parallel_size=4, # TODO: add this back in once have 2 GPUs
+        tensor_parallel_size=4,         # TODO: add this back in once have 2 GPUs
         kv_transfer_config=ktc,
-        max_model_len=128000,    # TODO: change this to 128000 once hosting devstral
+        max_model_len=128000,           # TODO: change this to 128000 once hosting devstral
         gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
+        seed=42,                        # For reproducibility
     )
-    
-    # # mistralai/Mistral-7B-Instruct-v0.2 args
-    # llm_args = EngineArgs(
-    #     model=model,
-    #     tokenizer_mode="mistral",
-    #     kv_transfer_config=ktc,
-    #     max_model_len=32000,
-    #     gpu_memory_utilization=0.8,
-    #     enable_prefix_caching=False,
-    # )
 
-    llm = LLM(**asdict(llm_args))
+    # llm = LLM(**asdict(llm_args))
+    llm = AsyncLLMEngine.from_engine_args(llm_args)
     try:
         yield llm
     finally:
@@ -273,6 +269,7 @@ class BlendServer:
         tokens = []
         # split on blend special string
         msg_chunks = msg_content.split(self.blend_special_str)
+        print(f"[INFO] split into {len(msg_chunks)} chunks")
         for chunk in msg_chunks:
             tokens.extend(self.tekkenizer.encode(chunk, bos=False, eos=False))
             tokens.extend(blend_tokens)
@@ -310,7 +307,8 @@ class BlendServer:
             # Add blend special string
             prompt_tokens.extend(blend_tokens)
 
-        res = prompt_tokens[:-len(blend_tokens)] + [eos]
+        # res = prompt_tokens[:-len(blend_tokens)] + [eos]
+        res = prompt_tokens[:-len(blend_tokens)]
         # print(f"@@@@@ Prompt tokens blend by chunk: {res}")
         return res
     
@@ -338,8 +336,9 @@ class BlendServer:
             signal.alarm(300)
             start_time = time.time()
             outputs = self.llm.generate(
-                prompt_token_ids=prompt_tokens, 
+                prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
                 sampling_params=sampling_params,
+                request_id=str(uuid.uuid4())
             )
             end_time = time.time()
             generation_time = end_time - start_time
@@ -430,7 +429,7 @@ class BlendServer:
             print(f"[ERROR] Failed to load mock requests from {mock_file}: {e}")
             return []
     
-    def run_mock_experiment(self, mock_file: str):
+    async def run_mock_experiment(self, mock_file: str):
         """Run a mock experiment by replaying requests from the log file"""
         print(f"[MOCK] Starting mock experiment with file: {mock_file}")
         
@@ -447,6 +446,7 @@ class BlendServer:
         
         total_original_time = 0
         total_mock_time = 0
+        total_ttft = 0
         successful_requests = 0
         
         for i, mock_data in enumerate(mock_requests):
@@ -458,12 +458,16 @@ class BlendServer:
             print(f"[MOCK] Request: {len(request.messages)} messages, max_tokens: {request.max_tokens}")
             
             try:
-                # Process the request
+                # Process the request (TTFT will be measured and printed during generation)
                 start_time = time.time()
-                response = self.handle_chat_completion_sync(request)
+                response = await self.handle_chat_completion_mock(request, i)
                 end_time = time.time()
                 
                 mock_time = end_time - start_time
+                ttft = response.usage.get('ttft', None)
+                if ttft is not None:
+                    total_ttft += ttft
+                
                 total_mock_time += mock_time
                 total_original_time += original_time
                 successful_requests += 1
@@ -471,6 +475,7 @@ class BlendServer:
                 print(f"[MOCK] Request {i+1} completed:")
                 print(f"  Original time: {original_time:.2f}s")
                 print(f"  Mock time: {mock_time:.2f}s")
+                print(f"  TTFT: {ttft:.4f}s" if ttft is not None else "  TTFT: N/A")  # Time To First Token
                 print(f"  Speedup: {original_time/mock_time:.2f}x" if mock_time > 0 else "  Speedup: N/A")
                 print(f"  Response tokens: {response.usage['completion_tokens']}")
                 
@@ -485,12 +490,14 @@ class BlendServer:
         if successful_requests > 0:
             print(f"  Average original time: {total_original_time/successful_requests:.2f}s")
             print(f"  Average mock time: {total_mock_time/successful_requests:.2f}s")
+            if total_ttft > 0:
+                print(f"  Average TTFT: {total_ttft/successful_requests:.4f}s")  # Time To First Token
             if total_mock_time > 0:
                 print(f"  Overall speedup: {total_original_time/total_mock_time:.2f}x")
     
-    def handle_chat_completion_sync(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        """Synchronous version of handle_chat_completion for mock mode"""
-        print(f"@@@@@ Handling chat completion request of n = {request.n}")
+    async def handle_chat_completion_mock(self, request: ChatCompletionRequest, rid: int) -> ChatCompletionResponse:
+        """Mock version of handle_chat_completion for mock mode with TTFT measurement"""
+        print(f"@@@@@ Handling chat completion request {rid} of n = {request.n} (mock)")
         try:
             # Convert messages to tokenized prompt
             # self.messages_to_prompt(request.messages)
@@ -502,36 +509,59 @@ class BlendServer:
                 temperature=request.temperature,
                 top_p=request.top_p,
                 n=request.n,
-                max_tokens=request.max_tokens
+                max_tokens=request.max_tokens,
+                output_kind=RequestOutputKind.DELTA
             )
             
             # Generate response
             signal.signal(signal.SIGALRM, self.handle_timeout)
             signal.alarm(300)
             start_time = time.time()
-            outputs = self.llm.generate(
-                prompt_token_ids=prompt_tokens, 
+            first_token_time = None
+            words = ""
+            ttft = None
+            
+            # Stream through the outputs to measure TTFT
+            async for output in self.llm.generate(
+                prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
                 sampling_params=sampling_params,
-            )
+                request_id=str(rid)
+            ):
+                # if first_token_time is None:
+                #     print(f"@@@@@ 1st RequestOutput: {output}")
+                # print(f"@@@@@ Token: {output.outputs[0].text}")
+                chunk_tokens = output.outputs[0].text     # assumes single completion
+                if chunk_tokens is not None:
+                    if first_token_time is None and chunk_tokens != "":
+                        first_token_time = time.time()
+                        ttft = first_token_time - start_time
+                        print(f"[INFO] TTFT: {ttft:.4f} seconds")
+                    words += chunk_tokens
+                if output.finished:
+                    # print(f"@@@@@ last RequestOutput: {output}")
+                    break
+
             end_time = time.time()
             generation_time = end_time - start_time
             signal.alarm(0)
+            
             print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
-            print(f"[INFO] Outputs: {outputs[0].outputs}")
+            print(f"[INFO] Final output: {words}")
+            
             choices = []
-            for i, completion in enumerate(outputs[0].outputs):
+            for i in range(request.n):
                 choices.append({
                     "index": i,
                     "message": {
                         "role": "assistant",
-                        "content": completion.text
+                        "content": words
                     },
                     "finish_reason": "stop"
                 })
                 
             # Calculate usage
             input_tokens = len(prompt_tokens)
-            output_tokens = sum(len(completion.text) for completion in outputs[0].outputs)
+            output_tokens = len(words) * request.n
             
             # Create response
             response = ChatCompletionResponse(
@@ -542,7 +572,8 @@ class BlendServer:
                 usage={
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens
+                    "total_tokens": input_tokens + output_tokens,
+                    "ttft": ttft
                 }
             )
             
@@ -638,7 +669,8 @@ def main():
     
     if args.mock:
         print(f"Mock mode enabled - replaying requests from: {args.mock_file}")
-        server.run_mock_experiment(args.mock_file)
+        import asyncio
+        asyncio.run(server.run_mock_experiment(args.mock_file))
     else:
         server.run(host=args.host, port=args.port)
 

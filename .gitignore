@@ -120,3 +120,7 @@ lmcache/experimental/tests
 # Ignore all log files
 *.log
 uv.lock
+
+# ttft test
+examples/blend_kv_v1/blend_res_stats_n_visuals/test/
+examples/blend_kv_v1/blend_res_stats_n_visuals/extract_and_plot_cache_data_run.out
