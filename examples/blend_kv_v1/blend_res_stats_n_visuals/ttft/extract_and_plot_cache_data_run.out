@@ -1,44 +1,74 @@
 Using Python 3.12.11 environment at: Cacheblend/.venv
-Audited 3 packages in 221ms
+Audited 3 packages in 26ms
 Performance Analysis
 ========================================
 Error log: /home/zhuofanc/lmcache.err
 Output log: /home/zhuofanc/lmcache.out
+Baseline log: /home/zhuofanc/vllm_ttft.out.baseline
 
-Extracted cache data for 246 requests from /home/zhuofanc/lmcache.err
-Extracted speedup data for 169 requests from /home/zhuofanc/lmcache.out
-Found 169 matching request IDs
-Request 0: Total=4955, Hit=0, Ratio=0.000, Speedup=0.60x, TTFT=2.273s
-Request 2: Total=3494, Hit=7, Ratio=0.002, Speedup=0.50x, TTFT=1.279s
-Request 3: Total=5188, Hit=46, Ratio=0.009, Speedup=0.84x, TTFT=0.646s
-Request 5: Total=38878, Hit=478, Ratio=0.012, Speedup=0.49x, TTFT=12.646s
-Request 6: Total=4992, Hit=46, Ratio=0.009, Speedup=0.42x, TTFT=1.638s
-Request 224: Total=780, Hit=32, Ratio=0.041, Speedup=1.38x, TTFT=0.109s
+Extracted cache data for 218 requests from /home/zhuofanc/lmcache.err
+Extracted speedup data for 155 requests from /home/zhuofanc/lmcache.out
+Extracted speedup data for 148 requests from /home/zhuofanc/vllm_ttft.out.baseline
+Found 155 matching request IDs
+Request 0: Total=4955, Hit=0, Ratio=0.000, Speedup=0.50x, TTFT=2.909s
+Request 2: Total=3494, Hit=7, Ratio=0.002, Speedup=0.52x, TTFT=1.364s
+Request 3: Total=5188, Hit=46, Ratio=0.009, Speedup=0.69x, TTFT=0.661s
+Request 5: Total=38878, Hit=478, Ratio=0.012, Speedup=0.50x, TTFT=13.225s
+Request 6: Total=4992, Hit=46, Ratio=0.009, Speedup=0.49x, TTFT=1.775s
+DEBUG: Final array lengths in correlate_data:
+  hit_ratios: 155
+  speedups: 155
+  request_ids: 155
+  total_tokens_list: 155
+  hit_tokens_list: 155
+  ttfts: 155
+DEBUG: Data array lengths after correlation:
+  hit_ratios: 155
+  speedups: 155
+  request_ids: 155
+  total_tokens: 155
+  hit_tokens: 155
+  ttfts: 155
 
 Data Summary:
 --------------------
-Total correlated requests: 169
-Average hit ratio: 0.065
-Average speedup: 0.78x
-Median hit ratio: 0.020
-Median speedup: 0.54x
-Max speedup: 12.55x
-Min speedup: 0.06x
+Total correlated requests: 155
+Average hit ratio: 0.058
+Average speedup: 0.61x
+Median hit ratio: 0.022
+Median speedup: 0.50x
+Max speedup: 2.61x
+Min speedup: 0.07x
 Max hit ratio: 1.000
 Min hit ratio: 0.000
-Average total tokens: 10153
-Median total tokens: 4954
-Average hit tokens: 275
-Average TTFT: 3.651s
-Median TTFT: 1.667s
+Average total tokens: 10899
+Median total tokens: 4963
+Average hit tokens: 276
+Average TTFT: 3.929s
+Median TTFT: 1.816s
 
 Correlation Coefficients:
-Hit ratio vs Speedup: -0.021
-Total tokens vs Speedup: -0.099
-Hit tokens vs Speedup: -0.070
-Hit ratio vs Total tokens: -0.183
-TTFT vs Hit ratio: -0.088
-TTFT vs Hit tokens: 0.200
+Hit ratio vs Speedup: -0.030
+Total tokens vs Speedup: 0.061
+Hit tokens vs Speedup: -0.059
+Hit ratio vs Total tokens: -0.203
+TTFT vs Hit ratio: -0.203
+TTFT vs Hit tokens: 0.264
+
+Baseline Comparison:
+--------------------
+Found 132 matching request IDs between LMCache and baseline
+Request 0: Baseline TTFT=8.300s, LMCache TTFT=2.909s, Actual Speedup=2.85x
+Request 2: Baseline TTFT=4.507s, LMCache TTFT=1.364s, Actual Speedup=3.30x
+Request 3: Baseline TTFT=2.554s, LMCache TTFT=0.661s, Actual Speedup=3.86x
+Request 5: Baseline TTFT=50.897s, LMCache TTFT=13.225s, Actual Speedup=3.85x
+Request 6: Baseline TTFT=2.422s, LMCache TTFT=1.775s, Actual Speedup=1.36x
+Actual Speedup Statistics:
+  Average: 3.08x
+  Median: 3.74x
+  Min: 0.02x
+  Max: 13.48x
+  Correlation with hit ratio: 0.197
 Plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/ttft/hit_ratio_vs_speedup.png
 Total tokens plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/ttft/total_tokens_vs_speedup.png
 Hit tokens plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/ttft/hit_tokens_vs_speedup.png
@@ -50,5 +80,8 @@ TTFT vs hit ratio plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend
 TTFT vs hit tokens plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/ttft/ttft_vs_hit_tokens.png
 All plots saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/ttft
 
+Creating actual speedup vs hit ratio plot...
+Actual speedup vs hit ratio plot saved to /home/zhuofanc/Cacheblend/LMCache/examples/blend_kv_v1/blend_res_stats_n_visuals/ttft/actual_speedup_vs_hit_ratio.png
+
 Data saved to cache_performance_data.csv for further analysis
-Run completed at: Mon Sep  1 11:27:35 PM EDT 2025
+Run completed at: Wed Sep  3 15:45:08 EDT 2025

@@ -30,10 +30,6 @@ from mistral_common.protocol.instruct.request import ChatCompletionRequest as Mi
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from huggingface_hub import hf_hub_download
 
-# First Party
-from lmcache.integration.vllm.utils import ENGINE_NAME
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
-
 
 class ChatMessage(BaseModel):
     role: str = Field(..., description="The role of the message sender")
@@ -90,15 +86,10 @@ def setup_environment_variables(
         # Set the maximum size of the local CPU size to 5GB
         os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
-
 @contextlib.contextmanager
-def build_llm_with_lmcache(lmcache_connector: str, model: str):
-    """Build LLM with LMCache integration"""
-    ktc = KVTransferConfig(
-        kv_connector=lmcache_connector,
-        kv_role="kv_both",
-    )
-    
+def build_llm_vllm(model: str):
+    """Build LLM without LMCache integration"""
+    print(f"@@@@@ Building LLM with vllm")
     # --tokenizer_mode mistral --config_format mistral --load_format mistral --tool-call-parser mistral --enable-auto-tool-choice --tensor-parallel-size 2
     llm_args = AsyncEngineArgs(
         model=model,
@@ -106,20 +97,20 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         config_format="mistral",
         load_format="mistral",
         tensor_parallel_size=4,         # TODO: add this back in once have 2 GPUs
-        kv_transfer_config=ktc,
+        # kv_transfer_config=ktc,
         max_model_len=128000,           # TODO: change this to 128000 once hosting devstral
         gpu_memory_utilization=0.7,
-        enable_prefix_caching=False,
+        enable_prefix_caching=True,
         seed=42,                        # For reproducibility
     )
 
     # llm = LLM(**asdict(llm_args))
     llm = AsyncLLMEngine.from_engine_args(llm_args)
+    print(f"@@@@@ LLM initialized with vllm")
     try:
         yield llm
     finally:
-        # Clean up lmcache backend
-        LMCacheEngineBuilder.destroy(ENGINE_NAME)
+        pass
 
 
 class BlendServer:
@@ -140,15 +131,17 @@ class BlendServer:
         self.tokenizer = MistralTokenizer.from_hf_hub(model)
         self.tekkenizer = self.tokenizer.instruct_tokenizer.tokenizer
         
-        # Initialize LLM with LMCache
-        self.llm_context = build_llm_with_lmcache(self.lmcache_connector, model)
-        self.llm = self.llm_context.__enter__()
+        # Initialize LLM without LMCache
+        self.llm_vllm_context = build_llm_vllm(model)
+        self.llm_vllm = self.llm_vllm_context.__enter__()
+        
+        print(f"@@@@@ LLM initialized (vllm)")
         
         # Create FastAPI app
-        self.app = FastAPI(title="LMCache Blend Server", version="1.0.0")
+        self.app = FastAPI(title="vLLM Server", version="1.0.0")
         self.setup_routes()
     
-    def log_request(self, request: ChatCompletionRequest, response: ChatCompletionResponse, generation_time: float):
+    def log_request(self, request: ChatCompletionRequest, response: ChatCompletionResponse, generation_time: float, ttft: float):
         """Log the request and response to the JSON file"""
         log_entry = {
             "timestamp": datetime.now().isoformat(),
@@ -166,7 +159,8 @@ class BlendServer:
                 "choices": response.choices,
                 "usage": response.usage
             },
-            "generation_time": generation_time
+            "generation_time": generation_time,
+            "ttft": ttft
         }
         
         try:
@@ -335,7 +329,7 @@ class BlendServer:
             signal.signal(signal.SIGALRM, self.handle_timeout)
             signal.alarm(300)
             start_time = time.time()
-            outputs = self.llm.generate(
+            outputs = self.llm_vllm.generate(
                 prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
                 sampling_params=sampling_params,
                 request_id=str(uuid.uuid4())
@@ -383,7 +377,7 @@ class BlendServer:
             print(f"@@@@@ Response # of choices: {len(choices)}")
             
             # Log the request and response
-            self.log_request(request, response, generation_time)
+            self.log_request(request, response, generation_time, 0.0)
             
             return response
             
@@ -494,93 +488,8 @@ class BlendServer:
                 print(f"  Average TTFT: {total_ttft/successful_requests:.4f}s")  # Time To First Token
             if total_mock_time > 0:
                 print(f"  Overall speedup: {total_original_time/total_mock_time:.2f}x")
-
-    async def handle_chat_completion_mock(self, request: ChatCompletionRequest, rid: int) -> ChatCompletionResponse:
-        """Mock version of handle_chat_completion for mock mode with TTFT measurement."""
-        print(f"@@@@@ Handling chat completion request {rid} of n = {request.n} (mock)")
-        # Convert messages to tokenized prompt
-        prompt_tokens: List[int] = self.messages_to_prompt_blend_by_chunk(request.messages)
-
-        # Create sampling parameters
-        sampling_params = SamplingParams(
-            temperature=request.temperature,
-            top_p=request.top_p,
-            n=request.n,
-            max_tokens=request.max_tokens,
-            output_kind=RequestOutputKind.DELTA,
-        )
-
-        # Variables for timing
-        start_time = time.perf_counter()
-        first_token_time = None
-        ttft = None
-        words = ""
-
-        async def _stream_once() -> None:
-            nonlocal words, first_token_time, ttft
-            async for output in self.llm.generate(
-                prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
-                sampling_params=sampling_params,
-                request_id=str(rid),
-            ):
-                chunk_tokens = output.outputs[0].text  # assumes single completion
-                if chunk_tokens:
-                    if first_token_time is None:
-                        first_token_time = time.perf_counter()
-                        ttft = first_token_time - start_time
-                        print(f"[INFO] TTFT: {ttft:.4f} seconds")
-                    words += chunk_tokens
-                if output.finished:
-                    break
-
-        try:
-            # Enforce a hard timeout for the whole streaming operation (e.g., 300s)
-            await asyncio.wait_for(_stream_once(), timeout=300.0)
-            end_time = time.perf_counter()
-            generation_time = end_time - start_time
-            print(f"[INFO] Generation time: {generation_time:.4f} seconds for {len(prompt_tokens)} tokens")
-            print(f"[INFO] Final output: {words}")
-
-            # Build choices (mock: duplicate same text n times)
-            choices = []
-            for i in range(request.n):
-                choices.append({
-                    "index": i,
-                    "message": {"role": "assistant", "content": words},
-                    "finish_reason": "stop",
-                })
-
-            # Mock usage accounting
-            input_tokens = len(prompt_tokens)
-            output_tokens = len(words) * request.n  # NOTE: mock approximation
-
-            response = ChatCompletionResponse(
-                id=f"chatcmpl-{int(time.time())}",
-                created=int(time.time()),
-                model=request.model,
-                choices=choices,
-                usage={
-                    "prompt_tokens": input_tokens,
-                    "completion_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
-                    "ttft": ttft,
-                },
-            )
-
-            print(f"@@@@@ Response # of choices: {len(choices)}")
-            return response
-
-        except asyncio.TimeoutError:
-            # If your LLM client supports cancel/abort, call it here (best-effort cleanup)
-            # e.g., await self.llm.abort(request_id=str(rid))   # if available
-            msg = f"Request {rid} timed out after 300 seconds."
-            print(f"[ERROR] {msg}")
-            await self.llm.abort(request_id=str(rid))
-        except Exception as e:
-            print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
-            raise
     
-    async def handle_chat_completion_mock_v0(self, request: ChatCompletionRequest, rid: int) -> ChatCompletionResponse:
+    async def handle_chat_completion_mock(self, request: ChatCompletionRequest, rid: int) -> ChatCompletionResponse:
         """Mock version of handle_chat_completion for mock mode with TTFT measurement"""
         print(f"@@@@@ Handling chat completion request {rid} of n = {request.n} (mock)")
         try:
@@ -607,7 +516,7 @@ class BlendServer:
             ttft = None
             
             # Stream through the outputs to measure TTFT
-            async for output in self.llm.generate(
+            async for output in self.llm_vllm.generate(
                 prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
                 sampling_params=sampling_params,
                 request_id=str(rid)
@@ -677,12 +586,12 @@ class BlendServer:
     
     def __del__(self):
         """Cleanup when server is destroyed"""
-        if hasattr(self, 'llm_context'):
-            self.llm_context.__exit__(None, None, None)
+        if hasattr(self, 'llm_vllm_context'):
+            self.llm_vllm_context.__exit__(None, None, None)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LMCache Blend Server")
+    parser = argparse.ArgumentParser(description="vLLM Server")
     parser.add_argument(
         "--model",
         # default="mistralai/Mistral-7B-Instruct-v0.2",
@@ -746,10 +655,8 @@ def main():
         log_file=args.log_file
     )
     
-    print(f"Starting LMCache Blend Server on {args.host}:{args.port}")
+    print(f"Starting vLLM Server on {args.host}:{args.port}")
     print(f"Model: {args.model}")
-    print(f"Use disk: {args.use_disk}")
-    print(f"Blend special string: {args.blend_special_str}")
     print(f"Request log file: {args.log_file}")
     
     if args.mock:
