@@ -2,6 +2,7 @@
 # Standard
 from typing import Any, Iterable, List, Optional, Tuple, Union
 import abc
+import traceback
 
 # Third Party
 from transformers import AutoTokenizer
@@ -16,7 +17,9 @@ from lmcache.v1.config import LMCacheEngineConfig
 logger = init_logger(__name__)
 
 NONE_HASH: int
-
+    
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+HACHIS_USING_DEVSTRAL = True
 
 class TokenDatabase(metaclass=abc.ABCMeta):
     """TokenDatabase is used to convert input tokens into list of
@@ -303,7 +306,17 @@ class SegmentTokenDatabase(TokenDatabase):
     """
 
     def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
-        super(SegmentTokenDatabase, self).__init__(config, metadata)
+        super(SegmentTokenDatabase, self).__init__(config, metadata)        
+        
+        if (HACHIS_USING_DEVSTRAL):
+            # temp fix for devstral, this need to be better handled later if using other models
+            logger.debug(f"Temp fix using Devstral Tekkenizer\nmetadata model name: {metadata.model_name}")
+            self.tokenizer = MistralTokenizer.from_hf_hub("mistralai/Devstral-Small-2507") 
+            self.sep_tokens = self.tokenizer.instruct_tokenizer.tokenizer.encode(
+                config.blend_special_str, bos=False, eos=False)
+            self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
+            self.sep_len = len(self.sep_tokens)
+            return
 
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
 
@@ -382,10 +395,15 @@ class SegmentTokenDatabase(TokenDatabase):
                 num_falses = mask.numel() - mask.long().sum().item()
             else:
                 num_falses = 0
-            assert num_falses < len(tokens), (
-                "The number of Falses in the mask shouldn't "
-                "be less than the length of tokens."
-            )
+            # assert num_falses < len(tokens), (
+            #     "The number of Falses in the mask shouldn't "
+            #     "be less than the length of tokens."
+            # )
+            if num_falses >= len(tokens):
+                logger.warning(f"The number of Falses in the mask is greater than the length of tokens. num_falses: {num_falses}, len(tokens): {len(tokens)}")
+                print("DEBUG: Stack trace at token processing:")
+                traceback.print_stack()
+                raise ValueError(f"The number of Falses in the mask is greater than the length of tokens. num_falses: {num_falses}, len(tokens): {len(tokens)}")
 
             token_chunks = self._fast_split_by_subtensor(tokens)
             start_idx = 0

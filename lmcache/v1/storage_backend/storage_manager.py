@@ -239,6 +239,10 @@ class StorageManager:
             )
             self.async_lookup_server = kwargs.pop("async_lookup_server")
             self.async_serializer = AsyncSerializer(self.allocator_backend, self.loop)
+        # Initialize async_serializer for layerwise operations even without async_lookup_server
+        # layerwise_batched_get always uses async_serializer
+        elif self.config.use_layerwise and not hasattr(self, 'async_serializer'):
+            self.async_serializer = AsyncSerializer(self.allocator_backend, self.loop)
 
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
@@ -413,6 +417,17 @@ class StorageManager:
 
         :return: A generator that yields a future for each layer.
         """
+        # Ensure async_serializer is initialized (should be done in post_init, but check here for safety)
+        if not hasattr(self, 'async_serializer'):
+            if self.config.use_layerwise:
+                # Lazy initialization if somehow post_init wasn't called
+                self.async_serializer = AsyncSerializer(self.allocator_backend, self.loop)
+            else:
+                raise RuntimeError(
+                    "async_serializer is not initialized. This is required for layerwise operations. "
+                    "Please ensure post_init() is called with async_lookup_server or use_layerwise is enabled."
+                )
+        
         if location is None:
             location = "LocalCPUBackend"
 

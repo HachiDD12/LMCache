@@ -85,7 +85,9 @@ class LMCBlender:
         attn_layer = layer.self_attn
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
 
-        if layer_id in self.common_metadata.check_layers:
+        # add empty check to avoid spurious layer compute 
+        if (self.common_metadata.check_layers is not None 
+            and layer_id in self.common_metadata.check_layers):
             diff_k = torch.sum(
                 (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
             )
