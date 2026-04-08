@@ -2,9 +2,11 @@
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import signal
 import uuid
@@ -61,6 +63,141 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[dict]
     usage: dict
+
+
+# ---------------------------------------------------------------------------
+# Stable per-request IDs
+#
+# Every request that reaches the server gets a content-derived ID that travels
+# through vLLM (as ``request.request_id``), into LMCache's adapter logs as the
+# ``Reqid:`` field, into the per-phase profiler records, and finally into the
+# viz / drill-down scripts. The ID is computed once at submission and is
+# byte-stable across reruns over the same mock file, so blend vs. noblend
+# comparisons can be joined per-request without depending on log ordering.
+# ---------------------------------------------------------------------------
+
+_REQUEST_ID_DIGEST_BYTES = 8  # 16 hex chars; collision-safe at any thesis scale
+_request_id_seen: dict[str, int] = {}
+_request_id_seen_lock = threading.Lock()
+
+
+def _canonical_request_preimage(request: "ChatCompletionRequest") -> str:
+    """Build the deterministic byte preimage used to derive a request ID.
+
+    Includes only fields that affect KV cache work (content + structural
+    knobs). Sampling-only fields like temperature / top_p are excluded so
+    that a sampling-knob sweep over the same prompts does not look like a
+    fresh corpus to the profiler.
+    """
+    payload = {
+        "model": request.model,
+        "messages": [
+            {"role": m.role, "content": m.content} for m in request.messages
+        ],
+        "max_tokens": request.max_tokens,
+        "n": request.n,
+        "tools": request.tools,
+    }
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def compute_request_id(request: "ChatCompletionRequest") -> str:
+    """Return a stable, content-derived request ID for ``request``.
+
+    Two byte-identical preimages get distinguished by an occurrence counter
+    so that duplicate-prompt entries in a captured trace remain individually
+    addressable. The first sighting of a hash returns the bare hash; the
+    second returns ``hash#1``, third ``hash#2``, etc. Two runs that walk the
+    same mock file in the same order produce identical IDs by construction.
+    """
+    preimage = _canonical_request_preimage(request)
+    base_hash = hashlib.blake2b(
+        preimage.encode("utf-8"), digest_size=_REQUEST_ID_DIGEST_BYTES
+    ).hexdigest()
+    with _request_id_seen_lock:
+        seen_count = _request_id_seen.get(base_hash, 0)
+        _request_id_seen[base_hash] = seen_count + 1
+    if seen_count == 0:
+        return base_hash
+    return f"{base_hash}#{seen_count}"
+
+
+def reset_request_id_state() -> None:
+    """Reset the twin-disambiguation counter.
+
+    Called at the start of each mock replay so the occurrence counters do
+    not leak across experiments hosted by the same long-lived server.
+    """
+    with _request_id_seen_lock:
+        _request_id_seen.clear()
+
+
+def emit_request_mapping(
+    req_id: str,
+    request: "ChatCompletionRequest",
+    prompt_token_count: Optional[int] = None,
+    mock_idx: Optional[int] = None,
+) -> None:
+    """Emit a single ``[MAPPING]`` log line for ``req_id``.
+
+    The line bridges the content hash to human-friendly attributes (mock
+    index, message count, max_tokens, prompt token length). Analysts can
+    grep this in the .out file to translate between hash and mock position
+    without any tooling.
+    """
+    fields = [
+        f"req_id={req_id}",
+    ]
+    if mock_idx is not None:
+        fields.append(f"mock_idx={mock_idx}")
+    fields.append(f"messages={len(request.messages)}")
+    fields.append(f"max_tokens={request.max_tokens}")
+    fields.append(f"n={request.n}")
+    if prompt_token_count is not None:
+        fields.append(f"prompt_tokens={prompt_token_count}")
+    print("[MAPPING] " + " ".join(fields))
+    sys.stdout.flush()
+
+
+def emit_run_manifest(mock_file: Optional[str], model: str, extra: dict) -> None:
+    """Emit a single ``[MANIFEST]`` line at run start.
+
+    Captures whatever experiment metadata is cheap to grab so that
+    post-processing can join profile records back to a configuration
+    without re-deriving it from filenames. Mock-file fingerprinting lets
+    cross-run joins detect silent drift if the underlying trace was
+    regenerated between runs.
+    """
+    fingerprint = None
+    if mock_file and os.path.exists(mock_file):
+        try:
+            h = hashlib.sha256()
+            with open(mock_file, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            fingerprint = h.hexdigest()[:16]
+        except Exception as e:
+            print(f"[WARNING] Failed to fingerprint mock file: {e}")
+
+    manifest = {
+        "model": model,
+        "mock_file": mock_file,
+        "mock_file_sha256_16": fingerprint,
+        "wall_ts": int(time.time()),
+        "lmcache_chunk_size": os.environ.get("LMCACHE_CHUNK_SIZE"),
+        "lmcache_blend_recompute_ratios": os.environ.get(
+            "LMCACHE_BLEND_RECOMPUTE_RATIOS"
+        ),
+        "lmcache_blend_check_layers": os.environ.get(
+            "LMCACHE_BLEND_CHECK_LAYERS"
+        ),
+        "lmcache_profile_output": os.environ.get("LMCACHE_PROFILE_OUTPUT"),
+    }
+    manifest.update(extra)
+    print("[MANIFEST] " + json.dumps(manifest, sort_keys=True))
+    sys.stdout.flush()
 
 
 def setup_environment_variables(
@@ -422,7 +559,8 @@ class BlendServer:
     
     async def handle_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request"""
-        print(f"@@@@@ Handling chat completion request of n = {request.n}")
+        req_id = compute_request_id(request)
+        print(f"@@@@@ Handling chat completion request {req_id} of n = {request.n}")
         try:
             # Convert messages to tokenized prompt based on blend granularity
             if self.blend_granularity == "none":
@@ -434,7 +572,9 @@ class BlendServer:
             else:
                 # Default to chunk if invalid granularity
                 prompt_tokens = self.messages_to_prompt_blend_by_chunk(request.messages)
-            
+
+            emit_request_mapping(req_id, request, prompt_token_count=len(prompt_tokens))
+
             # Create sampling parameters
             sampling_params = SamplingParams(
                 temperature=request.temperature,
@@ -442,20 +582,20 @@ class BlendServer:
                 n=request.n,
                 max_tokens=request.max_tokens
             )
-            
+
             # Generate response
             signal.signal(signal.SIGALRM, self.handle_timeout)
             signal.alarm(300)
             start_time = time.time()
             outputs = self.llm.generate(
-                prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
+                prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
                 sampling_params=sampling_params,
-                request_id=str(uuid.uuid4())
+                request_id=req_id,
             )
             end_time = time.time()
             generation_time = end_time - start_time
             signal.alarm(0)
-            print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
+            print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens (req_id={req_id})")
             # Extract generated text
             
             # show sample completion syntax for debugging
@@ -486,7 +626,7 @@ class BlendServer:
             
             # Create response
             response = ChatCompletionResponse(
-                id=f"chatcmpl-{int(time.time())}",
+                id=req_id,
                 created=int(time.time()),
                 model=request.model,
                 choices=choices,
@@ -496,22 +636,23 @@ class BlendServer:
                     "total_tokens": input_tokens + output_tokens
                 }
             )
-            
+
             print(f"@@@@@ Response # of choices: {len(choices)}")
-            
+
             # Log the request and response
             self.log_request(request, response, generation_time)
-            
+
             return response
-            
+
         except Exception as e:
             signal.alarm(0)
-            print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
+            print(f"[ERROR] Error handling chat completion (req_id={req_id}), type: {type(e)}, message: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
-    
+
     async def handle_chat_completion_ttft(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request with TTFT measurement"""
-        print(f"@@@@@ Handling chat completion request of n = {request.n}")
+        req_id = compute_request_id(request)
+        print(f"@@@@@ Handling chat completion request {req_id} of n = {request.n}")
         try:
             # Convert messages to tokenized prompt based on blend granularity
             if self.blend_granularity == "none":
@@ -523,7 +664,9 @@ class BlendServer:
             else:
                 # Default to chunk if invalid granularity
                 prompt_tokens: List[int] = self.messages_to_prompt_blend_by_chunk(request.messages)
-            
+
+            emit_request_mapping(req_id, request, prompt_token_count=len(prompt_tokens))
+
             # Calculate prefix cache statistics before generation (if enabled)
             prefix_cache_request_stats: Optional[PrefixCacheRequestStats] = None
             if self.prefix_cache_stats is not None:
@@ -554,7 +697,7 @@ class BlendServer:
                 async for output in self.llm.generate(
                     prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
                     sampling_params=sampling_params,
-                    request_id=str(uuid.uuid4()),
+                    request_id=req_id,
                 ):
                     # Handle multiple completions (n > 1)
                     for i, completion_output in enumerate(output.outputs):
@@ -564,9 +707,9 @@ class BlendServer:
                                 if first_token_time is None:
                                     first_token_time = time.perf_counter()
                                     ttft = first_token_time - start_time
-                                    print(f"[INFO] TTFT: {ttft:.4f} seconds")
+                                    print(f"[INFO] TTFT: {ttft:.4f} seconds (req_id={req_id})")
                                 completions_text[i] += chunk_text
-                    
+
                     if output.finished:
                         break
             
@@ -594,7 +737,7 @@ class BlendServer:
             
             # Create response
             response = ChatCompletionResponse(
-                id=f"chatcmpl-{int(time.time())}",
+                id=req_id,
                 created=int(time.time()),
                 model=request.model,
                 choices=choices,
@@ -605,26 +748,26 @@ class BlendServer:
                     "ttft": ttft,
                 }
             )
-            
+
             print(f"@@@@@ Response # of choices: {len(choices)}")
             sys.stdout.flush()
-            
+
             # Log the request and response
             self.log_request(request, response, generation_time)
-            
+
             # Write chunk distribution after each request
             self.write_chunk_distribution()
-            
+
             return response
-            
+
         except asyncio.TimeoutError:
-            msg = "Request timed out after 600 seconds."
+            msg = f"Request {req_id} timed out after 600 seconds."
             print(f"[ERROR] {msg}")
             raise HTTPException(status_code=500, detail=msg)
         except Exception as e:
-            print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
+            print(f"[ERROR] Error handling chat completion (req_id={req_id}), type: {type(e)}, message: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
-    
+
     def load_mock_requests(self, mock_file: str) -> List[dict]:
         """Load mock requests from a JSON log file"""
         try:
@@ -665,55 +808,79 @@ class BlendServer:
     async def run_mock_experiment(self, mock_file: str):
         """Run a mock experiment by replaying requests from the log file"""
         print(f"[MOCK] Starting mock experiment with file: {mock_file}")
-        
+
+        # Fresh twin-disambiguation counter so occurrence counts restart
+        # from zero for each experiment replayed by this server instance.
+        reset_request_id_state()
+
+        # Emit a one-line manifest capturing the run configuration and the
+        # mock file's content fingerprint. Lets post-processing detect silent
+        # drift if the mock file was regenerated between comparable runs.
+        emit_run_manifest(
+            mock_file=mock_file,
+            model=self.model,
+            extra={
+                "blend_granularity": self.blend_granularity,
+                "min_chunk_size": self.min_chunk_size,
+                "use_disk": self.use_disk,
+            },
+        )
+
         # Load mock requests
         mock_requests = self.load_mock_requests(mock_file)
         if not mock_requests:
             print("[MOCK] No valid requests found, exiting mock mode")
             return
-        
+
         # Sort by original timestamp if available
         mock_requests.sort(key=lambda x: x.get('original_timestamp', ''))
-        
+
         print(f"[MOCK] Replaying {len(mock_requests)} requests...")
-        
+
         total_original_time = 0
         total_mock_time = 0
         total_ttft = 0
         successful_requests = 0
-        
+
         for i, mock_data in enumerate(mock_requests):
             request = mock_data['request']
             original_time = mock_data.get('original_generation_time', 0)
             original_timestamp = mock_data.get('original_timestamp', 'unknown')
-            
-            print(f"[MOCK] Processing request {i+1}/{len(mock_requests)} (original: {original_timestamp})")
+
+            # Assign the stable content-derived ID before submission. Passing
+            # it explicitly into ``handle_chat_completion_mock`` guarantees
+            # the same string threads through vLLM, LMCache, and the profiler.
+            req_id = compute_request_id(request)
+
+            print(f"[MOCK] Processing request {i+1}/{len(mock_requests)} req_id={req_id} (original: {original_timestamp})")
             print(f"[MOCK] Request: {len(request.messages)} messages, max_tokens: {request.max_tokens}")
-            
+
             try:
                 # Process the request (TTFT will be measured and printed during generation)
                 start_time = time.time()
-                response = await self.handle_chat_completion_mock(request, i)
+                response = await self.handle_chat_completion_mock(
+                    request, i, req_id=req_id
+                )
                 end_time = time.time()
-                
+
                 mock_time = end_time - start_time
                 ttft = response.usage.get('ttft', None)
                 if ttft is not None:
                     total_ttft += ttft
-                
+
                 total_mock_time += mock_time
                 total_original_time += original_time
                 successful_requests += 1
-                
-                print(f"[MOCK] Request {i+1} completed:")
+
+                print(f"[MOCK] Request {i+1} completed (req_id={req_id}):")
                 print(f"  Original time: {original_time:.2f}s")
                 print(f"  Mock time: {mock_time:.2f}s")
                 print(f"  TTFT: {ttft:.4f}s" if ttft is not None else "  TTFT: N/A")  # Time To First Token
                 print(f"  Speedup: {original_time/mock_time:.2f}x" if mock_time > 0 else "  Speedup: N/A")
                 print(f"  Response tokens: {response.usage['completion_tokens']}")
-                
+
             except Exception as e:
-                print(f"[MOCK] Request {i+1} failed: {e}")
+                print(f"[MOCK] Request {i+1} failed (req_id={req_id}): {e}")
             sys.stdout.flush()
         
         # Print summary
@@ -729,9 +896,23 @@ class BlendServer:
             if total_mock_time > 0:
                 print(f"  Overall speedup: {total_original_time/total_mock_time:.2f}x")
 
-    async def handle_chat_completion_mock(self, request: ChatCompletionRequest, rid: int) -> ChatCompletionResponse:
-        """Mock version of handle_chat_completion for mock mode with TTFT measurement."""
-        print(f"@@@@@ Handling chat completion request {rid} of n = {request.n} (mock)")
+    async def handle_chat_completion_mock(
+        self,
+        request: ChatCompletionRequest,
+        rid: int,
+        req_id: Optional[str] = None,
+    ) -> ChatCompletionResponse:
+        """Mock version of handle_chat_completion for mock mode with TTFT measurement.
+
+        ``rid`` is the in-file index used for human-readable log messages.
+        ``req_id`` is the stable content-derived ID that vLLM, LMCache, and
+        the profiler use as the cross-component join key. If callers do not
+        pass one (e.g. legacy call sites) we derive it here so the function
+        stays robust.
+        """
+        if req_id is None:
+            req_id = compute_request_id(request)
+        print(f"@@@@@ Handling chat completion request {rid} req_id={req_id} of n = {request.n} (mock)")
         # Convert messages to tokenized prompt based on blend granularity
         if self.blend_granularity == "none":
             prompt_tokens: List[int] = self.messages_to_prompt_no_blend(request.messages)
@@ -743,6 +924,10 @@ class BlendServer:
             # Default to chunk if invalid granularity
             prompt_tokens: List[int] = self.messages_to_prompt_blend_by_chunk(request.messages)
 
+        emit_request_mapping(
+            req_id, request, prompt_token_count=len(prompt_tokens), mock_idx=rid
+        )
+
         # Calculate prefix cache statistics before generation (if enabled)
         prefix_cache_request_stats: Optional[PrefixCacheRequestStats] = None
         if self.prefix_cache_stats is not None:
@@ -751,7 +936,7 @@ class BlendServer:
             print(f"[INFO] Prefix cache hit tokens: {prefix_cache_request_stats.hit_tokens}", file=sys.stderr)
             print(f"[INFO] Prefix cache hit ratio: {prefix_cache_request_stats.hit_ratio:.4f}", file=sys.stderr)
             sys.stderr.flush()
-            
+
         # Create sampling parameters
         sampling_params = SamplingParams(
             temperature=request.temperature,
@@ -772,14 +957,14 @@ class BlendServer:
             async for output in self.llm.generate(
                 prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
                 sampling_params=sampling_params,
-                request_id=str(rid),
+                request_id=req_id,
             ):
                 chunk_tokens = output.outputs[0].text  # assumes single completion
                 if chunk_tokens:
                     if first_token_time is None:
                         first_token_time = time.perf_counter()
                         ttft = first_token_time - start_time
-                        print(f"[INFO] TTFT: {ttft:.4f} seconds")
+                        print(f"[INFO] TTFT: {ttft:.4f} seconds (req_id={req_id})")
                     words += chunk_tokens
                 if output.finished:
                     break
@@ -789,7 +974,7 @@ class BlendServer:
             await asyncio.wait_for(_stream_once(), timeout=300.0)
             end_time = time.perf_counter()
             generation_time = end_time - start_time
-            print(f"[INFO] Generation time: {generation_time:.4f} seconds for {len(prompt_tokens)} tokens")
+            print(f"[INFO] Generation time: {generation_time:.4f} seconds for {len(prompt_tokens)} tokens (req_id={req_id})")
             print(f"[INFO] Final output: {words}")
 
             # Build choices (mock: duplicate same text n times)
@@ -806,7 +991,7 @@ class BlendServer:
             output_tokens = len(words) * request.n  # NOTE: mock approximation
 
             response = ChatCompletionResponse(
-                id=f"chatcmpl-{int(time.time())}",
+                id=req_id,
                 created=int(time.time()),
                 model=request.model,
                 choices=choices,
@@ -823,18 +1008,23 @@ class BlendServer:
             return response
 
         except asyncio.TimeoutError:
-            # If your LLM client supports cancel/abort, call it here (best-effort cleanup)
-            # e.g., await self.llm.abort(request_id=str(rid))   # if available
-            msg = f"Request {rid} timed out after 300 seconds."
+            msg = f"Request rid={rid} req_id={req_id} timed out after 300 seconds."
             print(f"[ERROR] {msg}")
-            await self.llm.abort(request_id=str(rid))
+            await self.llm.abort(request_id=req_id)
         except Exception as e:
-            print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
+            print(f"[ERROR] Error handling chat completion (req_id={req_id}), type: {type(e)}, message: {str(e)}")
             raise
     
-    async def handle_chat_completion_mock_v0(self, request: ChatCompletionRequest, rid: int) -> ChatCompletionResponse:
+    async def handle_chat_completion_mock_v0(
+        self,
+        request: ChatCompletionRequest,
+        rid: int,
+        req_id: Optional[str] = None,
+    ) -> ChatCompletionResponse:
         """Mock version of handle_chat_completion for mock mode with TTFT measurement"""
-        print(f"@@@@@ Handling chat completion request {rid} of n = {request.n} (mock)")
+        if req_id is None:
+            req_id = compute_request_id(request)
+        print(f"@@@@@ Handling chat completion request {rid} req_id={req_id} of n = {request.n} (mock)")
         try:
             # Convert messages to tokenized prompt based on blend granularity
             if self.blend_granularity == "none":
@@ -846,7 +1036,11 @@ class BlendServer:
             else:
                 # Default to chunk if invalid granularity
                 prompt_tokens = self.messages_to_prompt_blend_by_chunk(request.messages)
-            
+
+            emit_request_mapping(
+                req_id, request, prompt_token_count=len(prompt_tokens), mock_idx=rid
+            )
+
             # Create sampling parameters
             sampling_params = SamplingParams(
                 temperature=request.temperature,
@@ -855,7 +1049,7 @@ class BlendServer:
                 max_tokens=request.max_tokens,
                 output_kind=RequestOutputKind.DELTA
             )
-            
+
             # Generate response
             signal.signal(signal.SIGALRM, self.handle_timeout)
             signal.alarm(300)
@@ -863,34 +1057,30 @@ class BlendServer:
             first_token_time = None
             words = ""
             ttft = None
-            
+
             # Stream through the outputs to measure TTFT
             async for output in self.llm.generate(
-                prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
+                prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
                 sampling_params=sampling_params,
-                request_id=str(rid)
+                request_id=req_id,
             ):
-                # if first_token_time is None:
-                #     print(f"@@@@@ 1st RequestOutput: {output}")
-                # print(f"@@@@@ Token: {output.outputs[0].text}")
                 chunk_tokens = output.outputs[0].text     # assumes single completion
                 if chunk_tokens is not None:
                     if first_token_time is None and chunk_tokens != "":
                         first_token_time = time.time()
                         ttft = first_token_time - start_time
-                        print(f"[INFO] TTFT: {ttft:.4f} seconds")
+                        print(f"[INFO] TTFT: {ttft:.4f} seconds (req_id={req_id})")
                     words += chunk_tokens
                 if output.finished:
-                    # print(f"@@@@@ last RequestOutput: {output}")
                     break
 
             end_time = time.time()
             generation_time = end_time - start_time
             signal.alarm(0)
-            
-            print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
+
+            print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens (req_id={req_id})")
             print(f"[INFO] Final output: {words}")
-            
+
             choices = []
             for i in range(request.n):
                 choices.append({
@@ -901,14 +1091,14 @@ class BlendServer:
                     },
                     "finish_reason": "stop"
                 })
-                
+
             # Calculate usage
             input_tokens = len(prompt_tokens)
             output_tokens = len(words) * request.n
-            
+
             # Create response
             response = ChatCompletionResponse(
-                id=f"chatcmpl-{int(time.time())}",
+                id=req_id,
                 created=int(time.time()),
                 model=request.model,
                 choices=choices,
@@ -919,14 +1109,14 @@ class BlendServer:
                     "ttft": ttft
                 }
             )
-            
+
             print(f"@@@@@ Response # of choices: {len(choices)}")
-            
+
             return response
-            
+
         except Exception as e:
             signal.alarm(0)
-            print(f"[ERROR] Error handling chat completion, type: {type(e)}, message: {str(e)}")
+            print(f"[ERROR] Error handling chat completion (req_id={req_id}), type: {type(e)}, message: {str(e)}")
             raise e
     
     def run(self, host: str = "0.0.0.0", port: int = 8000):

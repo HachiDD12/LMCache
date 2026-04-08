@@ -822,76 +822,86 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None:
                 continue
 
-            tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.cuda()
-            assert len(tokens) == len(slot_mapping)
+            # Stamp the request ID onto the profiler op stack so every nested
+            # cache_engine / gpu_connector op records it without further
+            # plumbing. The outer op produces one JSONL record per request
+            # for the start_load_kv path; nested store/retrieve ops emit
+            # their own records that inherit the same req_id.
+            with _profiler.op(
+                "adapter.start_load_kv",
+                req_id=request.req_id,
+                num_tokens=len(request.token_ids),
+            ):
+                tokens = request.token_ids
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = request.slot_mapping.cuda()
+                assert len(tokens) == len(slot_mapping)
 
-            self._stats_monitor.update_interval_vllm_hit_tokens(
-                request.load_spec.vllm_cached_tokens
-            )
-            token_mask = torch.ones(len(tokens), dtype=torch.bool)
-            masked_token_count = (
-                request.load_spec.vllm_cached_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
-            token_mask[:masked_token_count] = False
+                self._stats_monitor.update_interval_vllm_hit_tokens(
+                    request.load_spec.vllm_cached_tokens
+                )
+                token_mask = torch.ones(len(tokens), dtype=torch.bool)
+                masked_token_count = (
+                    request.load_spec.vllm_cached_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+                token_mask[:masked_token_count] = False
 
-            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            if self.use_layerwise:
-                if idx == last_idx:
-                    sync = True
-                else:
-                    sync = False
-                # NOTE(Jiayi): Perform blending before layerwise prefix caching
-                if self.enable_blending:
-                    # TODO(Jiayi): Need to make prefix caching and blending compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    )
-                else:
-                    with _profiler.phase("adapter.start_load_kv.retrieve_layer_init"):
-                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+                if self.use_layerwise:
+                    if idx == last_idx:
+                        sync = True
+                    else:
+                        sync = False
+                    # NOTE(Jiayi): Perform blending before layerwise prefix caching
+                    if self.enable_blending:
+                        # TODO(Jiayi): Need to make prefix caching and blending compatible
+                        self.blender.blend(
                             tokens[:lmcache_cached_tokens],
                             token_mask[:lmcache_cached_tokens],
                             kvcaches=kvcaches,
                             slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                            sync=sync,
                         )
-                        # NOTE: retrieve for two layers at the first layer
-                        next(layerwise_retriever)
-                        next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
-            else:
-                with _profiler.phase("adapter.start_load_kv.retrieve"):
-                    ret_token_mask = self.lmcache_engine.retrieve(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        request_configs=request.request_configs,
-                        req_id=request.req_id,
-                    )
+                    else:
+                        with _profiler.phase("adapter.start_load_kv.retrieve_layer_init"):
+                            layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                                tokens[:lmcache_cached_tokens],
+                                token_mask[:lmcache_cached_tokens],
+                                kvcaches=kvcaches,
+                                slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                                sync=sync,
+                            )
+                            # NOTE: retrieve for two layers at the first layer
+                            next(layerwise_retriever)
+                            next(layerwise_retriever)
+                        self.layerwise_retrievers.append(layerwise_retriever)
+                else:
+                    with _profiler.phase("adapter.start_load_kv.retrieve"):
+                        ret_token_mask = self.lmcache_engine.retrieve(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            request_configs=request.request_configs,
+                            req_id=request.req_id,
+                        )
 
-                # Check the result
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
-                )
-                if num_retrieved_tokens < num_expected_tokens:
-                    logger.error(
-                        "The number of retrieved tokens is less than the "
-                        "expected number of tokens! This should not happen!"
+                    # Check the result
+                    num_retrieved_tokens = ret_token_mask.sum().item()
+                    num_expected_tokens = (
+                        lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                     )
-                    logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
-                        num_retrieved_tokens,
-                        num_expected_tokens,
-                    )
+                    if num_retrieved_tokens < num_expected_tokens:
+                        logger.error(
+                            "The number of retrieved tokens is less than the "
+                            "expected number of tokens! This should not happen!"
+                        )
+                        logger.error(
+                            "Num retrieved tokens: %d, num expected tokens: %d",
+                            num_retrieved_tokens,
+                            num_expected_tokens,
+                        )
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -967,55 +977,65 @@ class LMCacheConnectorV1Impl:
                 if save_spec is None or not save_spec.can_save:
                     continue
 
-                token_ids = request.token_ids
-                assert isinstance(token_ids, list)
+                # Per-request profiler op so the nested store_layer
+                # initialization (and any inner cache_engine / gpu_connector
+                # ops it triggers on this thread) carry the request ID.
+                # The cross-request batched layer drains below run outside
+                # this op since they fan out across all requests at once.
+                with _profiler.op(
+                    "adapter.save_kv_layer.init",
+                    req_id=request.req_id,
+                    num_tokens=len(request.token_ids),
+                ):
+                    token_ids = request.token_ids
+                    assert isinstance(token_ids, list)
 
-                slot_mapping = request.slot_mapping
-                assert isinstance(slot_mapping, torch.Tensor)
-                assert len(slot_mapping) == len(token_ids)
+                    slot_mapping = request.slot_mapping
+                    assert isinstance(slot_mapping, torch.Tensor)
+                    assert len(slot_mapping) == len(token_ids)
 
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.cuda()
+                    # TODO: have a pre-allocated buffer to hold the slot_mappings
+                    slot_mapping = slot_mapping.cuda()
 
-                if self.kv_role == "kv_producer":
-                    skip_leading_tokens = 0
-                else:
-                    skip_leading_tokens = save_spec.skip_leading_tokens
+                    if self.kv_role == "kv_producer":
+                        skip_leading_tokens = 0
+                    else:
+                        skip_leading_tokens = save_spec.skip_leading_tokens
 
-                    if skip_leading_tokens == len(token_ids):
-                        continue  # skip this request
-                    # Align to lmcache chunk size
-                    skip_leading_tokens = (
-                        skip_leading_tokens
-                        // self._lmcache_chunk_size
-                        * self._lmcache_chunk_size
+                        if skip_leading_tokens == len(token_ids):
+                            continue  # skip this request
+                        # Align to lmcache chunk size
+                        skip_leading_tokens = (
+                            skip_leading_tokens
+                            // self._lmcache_chunk_size
+                            * self._lmcache_chunk_size
+                        )
+
+                    store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+                    store_mask[:skip_leading_tokens] = False
+
+                    logger.info(
+                        "Storing KV cache for %d out of %d tokens "
+                        "(skip_leading_tokens=%d) for request %s",
+                        len(token_ids) - skip_leading_tokens,
+                        len(token_ids),
+                        skip_leading_tokens,
+                        request.req_id,
                     )
 
-                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
-
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
-                    len(token_ids),
-                    skip_leading_tokens,
-                    request.req_id,
-                )
-
-                # TODO (Jiayi): need to make layerwise storing
-                # compatible with disagg spec
-                layerwise_storer = self.lmcache_engine.store_layer(
-                    token_ids,
-                    mask=store_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens,
-                    sync=is_first,
-                )
-                self.layerwise_storers.append(layerwise_storer)
-                if is_first:
-                    is_first = False
+                    # TODO (Jiayi): need to make layerwise storing
+                    # compatible with disagg spec
+                    layerwise_storer = self.lmcache_engine.store_layer(
+                        token_ids,
+                        mask=store_mask,
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping,
+                        offset=skip_leading_tokens,
+                        sync=is_first,
+                    )
+                    self.layerwise_storers.append(layerwise_storer)
+                    if is_first:
+                        is_first = False
 
         with _profiler.phase(
             f"adapter.save_kv_layer.L{self.current_layer}"
@@ -1056,70 +1076,78 @@ class LMCacheConnectorV1Impl:
             ) and self.kv_role != "kv_producer":
                 continue
 
-            token_ids = request.token_ids
+            # Wrap the per-request store path in an outer profiler op so the
+            # nested cache_engine.store record (and any gpu_connector phases
+            # underneath it) inherit the request ID.
+            with _profiler.op(
+                "adapter.wait_for_save",
+                req_id=request.req_id,
+                num_tokens=len(request.token_ids),
+            ):
+                token_ids = request.token_ids
 
-            slot_mapping = request.slot_mapping
-            assert isinstance(slot_mapping, torch.Tensor)
-            assert len(slot_mapping) == len(token_ids)
+                slot_mapping = request.slot_mapping
+                assert isinstance(slot_mapping, torch.Tensor)
+                assert len(slot_mapping) == len(token_ids)
 
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.cuda()
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = slot_mapping.cuda()
 
-            skip_leading_tokens = save_spec.skip_leading_tokens
-            if self.kv_role == "kv_producer":
-                skip_leading_tokens = min(
-                    skip_leading_tokens, request.disagg_spec.num_transferred_tokens
+                skip_leading_tokens = save_spec.skip_leading_tokens
+                if self.kv_role == "kv_producer":
+                    skip_leading_tokens = min(
+                        skip_leading_tokens, request.disagg_spec.num_transferred_tokens
+                    )
+
+                if skip_leading_tokens == len(token_ids):
+                    continue  # skip this request
+                # Align to lmcache chunk size
+                skip_leading_tokens = (
+                    skip_leading_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
                 )
 
-            if skip_leading_tokens == len(token_ids):
-                continue  # skip this request
-            # Align to lmcache chunk size
-            skip_leading_tokens = (
-                skip_leading_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
+                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+                store_mask[:skip_leading_tokens] = False
 
-            store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-            store_mask[:skip_leading_tokens] = False
+                logger.info(
+                    "Storing KV cache for %d out of %d tokens "
+                    "(skip_leading_tokens=%d) for request %s",
+                    len(token_ids) - skip_leading_tokens,
+                    len(token_ids),
+                    skip_leading_tokens,
+                    request.req_id,
+                )
 
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
+                is_last_prefill = request.is_last_prefill
+                if is_last_prefill:
+                    if request.disagg_spec:
+                        request.disagg_spec.is_last_prefill = True
+                else:
+                    token_len = len(token_ids)
+                    aligned_token_len = (
+                        token_len // self._lmcache_chunk_size * self._lmcache_chunk_size
+                    )
+                    token_ids = token_ids[:aligned_token_len]
+                    store_mask = store_mask[:aligned_token_len]
+                    slot_mapping = slot_mapping[:aligned_token_len]
 
-            is_last_prefill = request.is_last_prefill
-            if is_last_prefill:
+                with _profiler.phase("adapter.wait_for_save.store"):
+                    self.lmcache_engine.store(
+                        token_ids,
+                        mask=store_mask,
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping,
+                        offset=skip_leading_tokens,
+                        transfer_spec=request.disagg_spec,
+                        request_configs=request.request_configs,
+                    )
+
+                # NOTE(Jiayi): We assume all tokens are saved
+                save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
-                    request.disagg_spec.is_last_prefill = True
-            else:
-                token_len = len(token_ids)
-                aligned_token_len = (
-                    token_len // self._lmcache_chunk_size * self._lmcache_chunk_size
-                )
-                token_ids = token_ids[:aligned_token_len]
-                store_mask = store_mask[:aligned_token_len]
-                slot_mapping = slot_mapping[:aligned_token_len]
-
-            with _profiler.phase("adapter.wait_for_save.store"):
-                self.lmcache_engine.store(
-                    token_ids,
-                    mask=store_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens,
-                    transfer_spec=request.disagg_spec,
-                    request_configs=request.request_configs,
-                )
-
-            # NOTE(Jiayi): We assume all tokens are saved
-            save_spec.skip_leading_tokens = len(token_ids)
-            if request.disagg_spec:
-                request.disagg_spec.num_transferred_tokens = len(token_ids)
+                    request.disagg_spec.num_transferred_tokens = len(token_ids)
 
     @_lmcache_nvtx_annotate
     def get_finished(

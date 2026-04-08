@@ -94,6 +94,49 @@ def print_op_table(records: list[dict]) -> None:
     print("=" * 80)
 
 
+def print_req_id_table(records: list[dict], top_n: int = 20) -> None:
+    """Print a per-request summary keyed by the stable content-derived req_id.
+
+    The server now stamps each request with a stable hash that threads
+    through vLLM and LMCache, so profile records carry it as a top-level
+    field. This aggregates total phase time per request and prints the top
+    ``top_n`` slowest requests — the landing zone for outlier drill-down.
+    """
+    per_req: dict[str, float] = defaultdict(float)
+    per_req_n: dict[str, int] = defaultdict(int)
+    per_req_ops: dict[str, set] = defaultdict(set)
+
+    for rec in records:
+        req_id = rec.get("req_id")
+        if not req_id:
+            continue
+        total = sum(rec.get("phases", {}).values())
+        per_req[req_id] += total
+        per_req_n[req_id] += 1
+        per_req_ops[req_id].add(rec.get("op", "unknown"))
+
+    if not per_req:
+        print()
+        print("(no req_id-tagged records; older run without stable IDs?)")
+        return
+
+    ordered = sorted(per_req.items(), key=lambda kv: kv[1], reverse=True)
+
+    print()
+    print("=" * 96)
+    print(f"  LMCache KV-Cache Profile — Per-Request Totals (top {min(top_n, len(ordered))})")
+    print("=" * 96)
+    print(f"  {'req_id':<36} {'Records':>8} {'Ops':<32} {'Total ms':>12}")
+    print("-" * 96)
+    for req_id, total in ordered[:top_n]:
+        ops_str = ",".join(sorted(per_req_ops[req_id]))
+        if len(ops_str) > 30:
+            ops_str = ops_str[:27] + "..."
+        print(f"  {req_id:<36} {per_req_n[req_id]:>8} {ops_str:<32} {total:>12.2f}")
+    print("=" * 96)
+    print(f"  Total unique req_ids seen: {len(per_req)}")
+
+
 def plot_stacked_bar(records: list[dict], out_path: str) -> None:
     """Stacked bar chart showing average phase breakdown per operation type."""
     try:
@@ -192,6 +235,7 @@ def write_summary_txt(records: list[dict], out_path: str) -> None:
     try:
         print_op_table(records)
         print_phase_table(records)
+        print_req_id_table(records)
     finally:
         builtins.print = old_print
 
@@ -217,6 +261,7 @@ def main():
 
     print_op_table(records)
     print_phase_table(records)
+    print_req_id_table(records)
 
     stem = Path(path).stem
     parent = Path(out_dir) if out_dir else Path(path).parent

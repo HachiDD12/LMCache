@@ -37,124 +37,165 @@ def set_plot_fonts():
 def extract_cache_data(err_file_path):
     """
     Extract request ID, total tokens, and LMCache hit tokens from the error log file.
-    Uses an atomic counter (0-indexed) to align with speedup_data which uses req_id - 1.
-    
+
+    The server now stamps every request with a stable, content-derived
+    ``req_id`` that flows into LMCache as the ``Reqid:`` field, so we use
+    that string as the join key. To remain compatible with older logs that
+    were keyed positionally, we also return a parallel positional view.
+
     Args:
         err_file_path (str): Path to the lmcache.err file
-        
+
     Returns:
-        dict: Dictionary mapping request index (0-indexed) to (total_tokens, hit_tokens)
+        tuple: (cache_data_by_id, cache_data_by_pos)
+            - cache_data_by_id: dict[req_id_str, (total_tokens, hit_tokens)]
+            - cache_data_by_pos: dict[int, (total_tokens, hit_tokens)]
+              keyed by 0-indexed appearance order, for legacy joins.
     """
-    cache_data = {}
-    
-    # Pattern to match: Reqid: <any characters>, Total tokens X, LMCache hit tokens: Y, need to load: Z
-    # Reqid can be numeric, have underscores, or be SHA/UUID format (any characters up to comma)
+    cache_data_by_id = {}
+    cache_data_by_pos = {}
+
     pattern = r'Reqid: ([^,]+), Total tokens (\d+), LMCache hit tokens: (\d+), need to load: \d+'
     pat = re.compile(pattern)
-    
-    # Atomic counter starting at 0 to match speedup_data offset (req_id - 1)
+
     request_counter = 0
-    
+
     try:
         with open(err_file_path, 'r') as f:
             for line in f:
                 match = pat.search(line)
                 if match:
-                    # Extract Reqid (can be any format: numeric, with underscores, or SHA/UUID)
                     req_id_str = match.group(1).strip()
                     total_tokens = int(match.group(2))
                     hit_tokens = int(match.group(3))
-                    
-                    # Use atomic counter as key (0-indexed to match speedup_data's req_id - 1)
-                    cache_data[request_counter] = (total_tokens, hit_tokens)
+                    record = (total_tokens, hit_tokens)
+
+                    cache_data_by_id[req_id_str] = record
+                    cache_data_by_pos[request_counter] = record
                     request_counter += 1
     except FileNotFoundError:
         print(f"Error: Could not find file {err_file_path}")
-        return {}
+        return {}, {}
     except Exception as e:
         print(f"Error reading {err_file_path}: {e}")
-        return {}
-    
-    print(f"Extracted cache data for {len(cache_data)} requests from {err_file_path}")
-    return cache_data
+        return {}, {}
+
+    print(f"Extracted cache data for {len(cache_data_by_pos)} requests from {err_file_path}"
+          f" ({len(cache_data_by_id)} unique req_ids)")
+    return cache_data_by_id, cache_data_by_pos
 
 def extract_speedup_data(out_file_path):
     """
     Extract TTFT and speedup from the output log file.
-    Uses a monotonic counter (0-indexed) to align with cache_data.
-    Supports two formats:
-    1. Full format: '[MOCK] Request N completed: ... TTFT: X.XXs Speedup: X.XXx'
-    2. Fallback format: '[INFO] TTFT: X.XX seconds' (speedup set to 1.0)
-    
+
+    The server emits the stable request ID inside the ``[MOCK] Request N
+    completed (req_id=...):`` line and the ``[INFO] TTFT: ... seconds
+    (req_id=...)`` line. We capture it as the join key, falling back to a
+    monotonic counter for legacy logs that predate the change.
+
     Args:
         out_file_path (str): Path to the lmcache.out file
-        
+
     Returns:
-        dict: Dictionary mapping request index (0-indexed) to (ttft, speedup)
+        tuple: (speedup_data_by_id, speedup_data_by_pos)
+            - speedup_data_by_id: dict[req_id_str, (ttft, speedup)]
+            - speedup_data_by_pos: dict[int, (ttft, speedup)]
     """
-    speedup_data = {}
-    
-    # Primary pattern: Full format with [MOCK] Request and Speedup
-    primary_pattern = r'@@@@@ Response # of choices: (\d+)\s*\[MOCK\] Request (\d+) completed:.*?TTFT: ([0-9.]+)s\s*Speedup: ([0-9.]+)x'
+    speedup_data_by_id = {}
+    speedup_data_by_pos = {}
+
+    # Primary pattern: optional ``(req_id=...)`` after ``completed`` so it
+    # matches both new and legacy logs. The req_id group is None when absent.
+    primary_pattern = (
+        r'@@@@@ Response # of choices: (\d+)\s*'
+        r'\[MOCK\] Request (\d+) completed(?:\s*\(req_id=([^)]+)\))?:'
+        r'.*?TTFT: ([0-9.]+)s\s*Speedup: ([0-9.]+)x'
+    )
     primary_pat = re.compile(primary_pattern, re.DOTALL)
-    
-    # Fallback pattern: Just TTFT line (format: [INFO] TTFT: X.XX seconds)
-    fallback_pattern = r'\[INFO\] TTFT: ([0-9.]+) seconds'
+
+    # Fallback pattern: ``[INFO] TTFT: X.XX seconds (req_id=...)``
+    # The req_id parenthetical is optional for legacy logs.
+    fallback_pattern = r'\[INFO\] TTFT: ([0-9.]+) seconds(?:\s*\(req_id=([^)]+)\))?'
     fallback_pat = re.compile(fallback_pattern)
-    
-    # Monotonic counter starting at 0 to match cache_data
+
     request_counter = 0
-    
+
     try:
         with open(out_file_path, 'r') as f:
             content = f.read()
-            
-            # Try primary pattern first
+
             primary_matches = primary_pat.findall(content)
             used_fallback = False
-            
+
             if primary_matches:
                 for match in primary_matches:
-                    num_choices = int(match[0])
-                    req_id = int(match[1])
-                    ttft = float(match[2])
-                    speedup = float(match[3])
-                    # Use monotonic counter for alignment (0-indexed)
-                    speedup_data[request_counter] = (ttft, speedup)
+                    req_id_str = (match[2] or "").strip() or None
+                    ttft = float(match[3])
+                    speedup = float(match[4])
+                    record = (ttft, speedup)
+                    if req_id_str:
+                        speedup_data_by_id[req_id_str] = record
+                    speedup_data_by_pos[request_counter] = record
                     request_counter += 1
             else:
-                # Fallback: Extract just TTFT lines
                 used_fallback = True
                 fallback_matches = fallback_pat.findall(content)
                 for match in fallback_matches:
-                    ttft = float(match)
-                    # Set speedup to 1.0 (no speedup) when not available
-                    speedup_data[request_counter] = (ttft, 1.0)
+                    ttft = float(match[0])
+                    req_id_str = (match[1] or "").strip() or None
+                    record = (ttft, 1.0)
+                    if req_id_str:
+                        speedup_data_by_id[req_id_str] = record
+                    speedup_data_by_pos[request_counter] = record
                     request_counter += 1
-                
+
     except FileNotFoundError:
         print(f"Error: Could not find file {out_file_path}")
-        return {}
+        return {}, {}
     except Exception as e:
         print(f"Error reading {out_file_path}: {e}")
-        return {}
-    
-    print(f"Extracted speedup data for {len(speedup_data)} requests from {out_file_path}")
+        return {}, {}
+
+    print(f"Extracted speedup data for {len(speedup_data_by_pos)} requests from {out_file_path}"
+          f" ({len(speedup_data_by_id)} unique req_ids)")
     if used_fallback:
         print(f"  Note: Used fallback pattern (TTFT only, speedup set to 1.0)")
-    return speedup_data
+    return speedup_data_by_id, speedup_data_by_pos
+
+
+def _select_join_view(cache_data, speedup_data):
+    """Pick the strongest join key the two datasets share.
+
+    Returns ``(cache_view, speedup_view, mode)``. ``mode`` is ``"req_id"``
+    when both sides have stable hash IDs, otherwise ``"position"`` for the
+    legacy positional fallback.
+    """
+    cache_by_id, cache_by_pos = cache_data
+    speedup_by_id, speedup_by_pos = speedup_data
+
+    if cache_by_id and speedup_by_id:
+        common = set(cache_by_id.keys()) & set(speedup_by_id.keys())
+        if common:
+            return cache_by_id, speedup_by_id, "req_id"
+        print("Warning: cache and speedup logs both have req_ids but they "
+              "do not overlap; falling back to positional join (was the "
+              "mock file regenerated between runs?)")
+
+    return cache_by_pos, speedup_by_pos, "position"
+
 
 def correlate_data(cache_data, speedup_data):
     """
-    Correlate cache data with speedup data based on request indices.
-    Both datasets use 0-indexed counters for alignment.
-    
+    Correlate cache data with speedup data using the strongest available
+    join key (stable req_id strings, or positional fallback for legacy logs).
+
     Args:
-        cache_data (dict): Cache hit data from error log (0-indexed by order of appearance)
-        speedup_data (dict): Speedup data from output log (0-indexed after req_id - 1)
-        
+        cache_data: Output of :func:`extract_cache_data` (id, pos) tuple.
+        speedup_data: Output of :func:`extract_speedup_data` (id, pos) tuple.
+
     Returns:
-        tuple: (hit_ratios, speedups, request_ids, total_tokens_list, hit_tokens_list, ttfts) for plotting
+        tuple: (hit_ratios, speedups, request_ids, total_tokens_list,
+                hit_tokens_list, ttfts) for plotting.
     """
     hit_ratios = []
     speedups = []
@@ -162,32 +203,36 @@ def correlate_data(cache_data, speedup_data):
     total_tokens_list = []
     hit_tokens_list = []
     ttfts = []
-    
-    # Find common request IDs between the two datasets
-    common_ids = set(cache_data.keys()) & set(speedup_data.keys())
-    
+
+    cache_view, speedup_view, mode = _select_join_view(cache_data, speedup_data)
+
+    common_ids = set(cache_view.keys()) & set(speedup_view.keys())
+
     if not common_ids:
         print("Warning: No matching request IDs found between the two log files")
         return [], [], [], [], [], []
-    
-    print(f"Found {len(common_ids)} matching request IDs")
-    
-    for req_id in sorted(common_ids):
-        total_tokens, hit_tokens = cache_data[req_id]
-        ttft, speedup = speedup_data[req_id]
-        
+
+    print(f"Found {len(common_ids)} matching request IDs (join mode: {mode})")
+
+    # Sort numerically for positional ints, lexically for hash strings.
+    sorted_ids = sorted(common_ids, key=lambda k: (isinstance(k, str), k))
+
+    for req_id in sorted_ids:
+        total_tokens, hit_tokens = cache_view[req_id]
+        ttft, speedup = speedup_view[req_id]
+
         # Calculate hit ratio (hit tokens / total tokens)
         hit_ratio = hit_tokens / total_tokens if total_tokens > 0 else 0
-        
+
         hit_ratios.append(hit_ratio)
         speedups.append(speedup)
         request_ids.append(req_id)
         total_tokens_list.append(total_tokens)
         hit_tokens_list.append(hit_tokens)
         ttfts.append(ttft)
-        
+
         # Debug output for first few entries
-        if len(hit_ratios) <= 5 or req_id == 225 or req_id == 224:
+        if len(hit_ratios) <= 5:
             print(f"Request {req_id}: Total={total_tokens}, Hit={hit_tokens}, "
                   f"Ratio={hit_ratio:.3f}, Speedup={speedup:.2f}x, TTFT={ttft:.3f}s")
     
@@ -701,16 +746,33 @@ def create_ttft_vs_hit_tokens_plot(ttfts, hit_tokens, request_ids, output_file=N
 def calculate_actual_speedup(lmcache_data, baseline_data):
     """
     Calculate actual speedup by comparing LMCache TTFT with baseline TTFT.
-    
+
+    Both arguments are the (by_id, by_pos) tuples returned by
+    :func:`extract_speedup_data`. We use stable req_id strings whenever both
+    sides have them, falling back to positional alignment for legacy logs.
+
     Args:
-        lmcache_data (dict): LMCache data mapping request ID to (ttft, speedup)
-        baseline_data (dict): Baseline data mapping request ID to (ttft, speedup)
-        
+        lmcache_data: LMCache (by_id, by_pos) speedup tuple.
+        baseline_data: Baseline (by_id, by_pos) speedup tuple.
+
     Returns:
-        tuple: (request_ids, actual_speedups, lmcache_ttfts, baseline_ttfts) for requests with both data
+        tuple: (request_ids, actual_speedups, lmcache_ttfts, baseline_ttfts)
     """
-    # Find common request IDs between LMCache and baseline
-    common_ids = set(lmcache_data.keys()) & set(baseline_data.keys())
+    lmcache_by_id, lmcache_by_pos = lmcache_data
+    baseline_by_id, baseline_by_pos = baseline_data
+
+    if (lmcache_by_id and baseline_by_id
+            and (set(lmcache_by_id) & set(baseline_by_id))):
+        lmcache_view = lmcache_by_id
+        baseline_view = baseline_by_id
+        join_mode = "req_id"
+    else:
+        lmcache_view = lmcache_by_pos
+        baseline_view = baseline_by_pos
+        join_mode = "position"
+
+    common_ids = set(lmcache_view.keys()) & set(baseline_view.keys())
+    print(f"calculate_actual_speedup: join mode = {join_mode}")
     
     if not common_ids:
         print("Warning: No matching request IDs found between LMCache and baseline data")
@@ -722,10 +784,11 @@ def calculate_actual_speedup(lmcache_data, baseline_data):
     actual_speedups = []
     lmcache_ttfts = []
     baseline_ttfts = []
-    
-    for req_id in sorted(common_ids):
-        lmcache_ttft, _ = lmcache_data[req_id]
-        baseline_ttft, _ = baseline_data[req_id]
+
+    sorted_ids = sorted(common_ids, key=lambda k: (isinstance(k, str), k))
+    for req_id in sorted_ids:
+        lmcache_ttft, _ = lmcache_view[req_id]
+        baseline_ttft, _ = baseline_view[req_id]
         
         # Calculate actual speedup: baseline_ttft / lmcache_ttft
         # Higher values mean LMCache is faster (better)
@@ -1109,19 +1172,21 @@ def main():
         print("NOTE: Baseline comparison plots will be skipped. Only standard plots will be generated.")
     print()
     
-    # Extract data from both log files
+    # Extract data from both log files. Both helpers now return
+    # (by_id, by_pos) tuples so downstream code can prefer stable req_id
+    # joins with a positional fallback for legacy logs.
     cache_data = extract_cache_data(err_file)
     speedup_data = extract_speedup_data(out_file)
-    
+
     # Extract baseline data if provided
     baseline_data = None
     if baseline_file:
         baseline_data = extract_speedup_data(baseline_file)
-        if not baseline_data:
+        if not baseline_data[0] and not baseline_data[1]:
             print("Warning: Failed to extract baseline data. Continuing without baseline comparison.")
             baseline_data = None
-    
-    if not cache_data or not speedup_data:
+
+    if (not cache_data[0] and not cache_data[1]) or (not speedup_data[0] and not speedup_data[1]):
         print("Failed to extract data from one or both log files. Exiting.")
         return
     
@@ -1181,13 +1246,28 @@ def main():
         print("\nBaseline Comparison:")
         print("-" * 20)
         actual_req_ids, actual_speedups, lmcache_ttfts, baseline_ttfts = calculate_actual_speedup(speedup_data, baseline_data)
-        
+
+        # Unpack the cache data views once so downstream lookups can prefer
+        # stable req_id keys and fall back to positional keys transparently.
+        cache_by_id, cache_by_pos = cache_data
+
+        def _cache_lookup(req_id):
+            if req_id in cache_by_id:
+                return cache_by_id[req_id]
+            if req_id in cache_by_pos:
+                return cache_by_pos[req_id]
+            return None
+
         if actual_speedups:
             # Filter cache data to only include requests with actual speedup data
-            actual_cache_data = {req_id: cache_data[req_id] for req_id in actual_req_ids if req_id in cache_data}
+            actual_cache_data = {
+                req_id: _cache_lookup(req_id)
+                for req_id in actual_req_ids
+                if _cache_lookup(req_id) is not None
+            }
             actual_hit_ratios = []
             actual_hit_tokens = []
-            
+
             for req_id in actual_req_ids:
                 if req_id in actual_cache_data:
                     total_tokens_req, hit_tokens_req = actual_cache_data[req_id]
@@ -1261,8 +1341,9 @@ def main():
             # Get total tokens for the actual speedup data
             actual_total_tokens = []
             for req_id in actual_speedup_data['request_ids']:
-                if req_id in cache_data:
-                    total_tokens_req, _ = cache_data[req_id]
+                rec = _cache_lookup(req_id)
+                if rec is not None:
+                    total_tokens_req, _ = rec
                     actual_total_tokens.append(total_tokens_req)
                 else:
                     actual_total_tokens.append(0)

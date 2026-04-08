@@ -10,12 +10,17 @@ Control output location:
 
 Each store/retrieve operation emits one JSON line with phase-level timings
 (in milliseconds). GPU timings use torch.cuda.synchronize() for accuracy.
+
+Operations form a stack per thread; nested ops automatically inherit the
+``req_id`` of their parent, so once an adapter wraps a per-request block in
+``profiler.op(req_id=...)`` every cache_engine / gpu_connector op underneath
+is keyed by that request ID without further plumbing.
 """
 
 # Standard
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Optional
 import json
 import os
 import threading
@@ -33,6 +38,10 @@ class KVCacheProfiler:
 
     All timing values are in milliseconds. GPU phases call
     torch.cuda.synchronize() before/after to capture real device time.
+
+    Thread-safety: each thread maintains its own op stack via ``threading.local``,
+    so TP workers do not bleed phases between requests. The output JSONL writer
+    is guarded by a process-wide lock so concurrent flushes do not interleave.
     """
 
     _instance: Optional["KVCacheProfiler"] = None
@@ -41,7 +50,7 @@ class KVCacheProfiler:
     def __init__(self):
         self.enabled = _ENABLED
         self._records: dict[str, list[float]] = defaultdict(list)
-        self._current_op: Optional[dict] = None
+        self._tls = threading.local()
         self._write_lock = threading.Lock()
         self._output_path = _OUTPUT_PATH
 
@@ -57,28 +66,68 @@ class KVCacheProfiler:
         return cls._instance
 
     # ------------------------------------------------------------------
+    # Per-thread op stack
+    # ------------------------------------------------------------------
+
+    def _stack(self) -> list[dict]:
+        stack = getattr(self._tls, "stack", None)
+        if stack is None:
+            stack = []
+            self._tls.stack = stack
+        return stack
+
+    # ------------------------------------------------------------------
     # Operation lifecycle
     # ------------------------------------------------------------------
 
-    def start_op(self, op_type: str, **metadata) -> None:
-        """Begin a new operation (e.g. 'store', 'retrieve')."""
+    def start_op(self, op_type: str, req_id: Optional[str] = None, **metadata: Any) -> None:
+        """Begin a new operation (e.g. 'store', 'retrieve').
+
+        If ``req_id`` is not given, the new op inherits the ``req_id`` of its
+        parent op (if any). This lets adapter-level wrappers stamp the request
+        ID once and have nested cache_engine / gpu_connector ops pick it up
+        automatically.
+        """
         if not self.enabled:
             return
-        self._current_op = {
+        stack = self._stack()
+        if req_id is None and stack:
+            req_id = stack[-1].get("req_id")
+        op: dict[str, Any] = {
             "op": op_type,
             "phases": {},
             **metadata,
         }
+        if req_id is not None:
+            op["req_id"] = req_id
+        stack.append(op)
 
     def end_op(self) -> None:
-        """Finish the current operation; flush record to JSONL file."""
-        if not self.enabled or self._current_op is None:
+        """Finish the most recently started op; flush its record to JSONL."""
+        if not self.enabled:
             return
-        self._current_op["wall_ts"] = time.time()
+        stack = self._stack()
+        if not stack:
+            return
+        op = stack.pop()
+        op["wall_ts"] = time.time()
+        op["thread"] = threading.get_ident()
         with self._write_lock:
             with open(self._output_path, "a") as f:
-                f.write(json.dumps(self._current_op) + "\n")
-        self._current_op = None
+                f.write(json.dumps(op) + "\n")
+
+    @contextmanager
+    def op(self, op_type: str, req_id: Optional[str] = None, **metadata: Any):
+        """Context manager wrapping ``start_op`` / ``end_op``.
+
+        Preferred entry point for new instrumentation -- guarantees ``end_op``
+        runs even if the body raises.
+        """
+        self.start_op(op_type, req_id=req_id, **metadata)
+        try:
+            yield
+        finally:
+            self.end_op()
 
     # ------------------------------------------------------------------
     # Phase timing helpers
@@ -87,6 +136,9 @@ class KVCacheProfiler:
     @contextmanager
     def phase(self, name: str, sync_cuda: bool = True):
         """Context manager that times a named phase.
+
+        The elapsed value is attached to the innermost active op (if any) and
+        also accumulated into the global ``_records`` dict for the summary.
 
         Args:
             name: human-readable phase label, e.g. 'store.gpu_offload'.
@@ -107,16 +159,18 @@ class KVCacheProfiler:
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         self._records[name].append(elapsed_ms)
-        if self._current_op is not None:
-            self._current_op["phases"][name] = elapsed_ms
+        stack = self._stack()
+        if stack:
+            stack[-1]["phases"][name] = elapsed_ms
 
     def record(self, name: str, elapsed_ms: float) -> None:
         """Manually record a timing value for a phase."""
         if not self.enabled:
             return
         self._records[name].append(elapsed_ms)
-        if self._current_op is not None:
-            self._current_op["phases"][name] = elapsed_ms
+        stack = self._stack()
+        if stack:
+            stack[-1]["phases"][name] = elapsed_ms
 
     # ------------------------------------------------------------------
     # Summary

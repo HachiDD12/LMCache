@@ -5,10 +5,12 @@ Extracts cache data and TTFT from both runs and creates comparison plots.
 Skips cache-related plots if cache data is not available.
 """
 
+import json
 import re
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
+from collections import defaultdict
 from pathlib import Path
 import argparse
 from scipy.stats import gaussian_kde
@@ -31,239 +33,279 @@ def set_plot_fonts():
 def extract_cache_data(err_file_path):
     """
     Extract request ID, total tokens, and LMCache hit tokens from the error log file.
-    Uses an atomic counter (0-indexed) to align with speedup_data.
-    
+
+    The server stamps each request with a stable, content-derived ``req_id``
+    that flows into the LMCache ``Reqid:`` log line. We preserve it as the
+    primary join key and also return a positional view so legacy logs keyed
+    by order of appearance still work.
+
     Args:
         err_file_path (str): Path to the lmcache.err file
-        
+
     Returns:
-        dict: Dictionary mapping request index (0-indexed) to (total_tokens, hit_tokens)
+        tuple: (cache_data_by_id, cache_data_by_pos)
     """
-    cache_data = {}
-    
-    # Pattern to match: Reqid: <any characters>, Total tokens X, LMCache hit tokens: Y, need to load: Z
+    cache_data_by_id = {}
+    cache_data_by_pos = {}
+
     pattern = r'Reqid: ([^,]+), Total tokens (\d+), LMCache hit tokens: (\d+), need to load: \d+'
     pat = re.compile(pattern)
-    
-    # Atomic counter starting at 0
+
     request_counter = 0
-    
+
     try:
         with open(err_file_path, 'r') as f:
             for line in f:
                 match = pat.search(line)
                 if match:
+                    req_id_str = match.group(1).strip()
                     total_tokens = int(match.group(2))
                     hit_tokens = int(match.group(3))
-                    cache_data[request_counter] = (total_tokens, hit_tokens)
+                    record = (total_tokens, hit_tokens)
+                    cache_data_by_id[req_id_str] = record
+                    cache_data_by_pos[request_counter] = record
                     request_counter += 1
     except FileNotFoundError:
         print(f"Warning: Could not find file {err_file_path}")
-        return {}
+        return {}, {}
     except Exception as e:
         print(f"Warning: Error reading {err_file_path}: {e}")
-        return {}
-    
-    if cache_data:
-        print(f"Extracted cache data for {len(cache_data)} requests from {err_file_path}")
-    return cache_data
+        return {}, {}
+
+    if cache_data_by_pos:
+        print(f"Extracted cache data for {len(cache_data_by_pos)} requests from {err_file_path}"
+              f" ({len(cache_data_by_id)} unique req_ids)")
+    return cache_data_by_id, cache_data_by_pos
 
 
 def extract_prefix_cache_data(err_file_path):
     """
     Extract prefix cache hit tokens from the error log file.
-    These are printed by our prefix_cache_stats module before each LMCache request.
-    Format: [INFO] Prefix cache hit tokens: X
-    
-    Uses an atomic counter (0-indexed) to align with other data.
-    
+
+    Format: ``[INFO] Prefix cache hit tokens: X``. The stats line itself
+    has no req_id, so we rely on positional alignment. Returned tuple
+    mirrors :func:`extract_cache_data` for call-site consistency; the
+    ``by_id`` view is always empty.
+
     Args:
         err_file_path (str): Path to the .err file
-        
+
     Returns:
-        dict: Dictionary mapping request index (0-indexed) to prefix_hit_tokens
+        tuple: ({}, {position: prefix_hit_tokens})
     """
-    prefix_cache_data = {}
-    
-    # Pattern to match: [INFO] Prefix cache hit tokens: X
+    prefix_cache_data_by_pos = {}
+
     pattern = r'\[INFO\] Prefix cache hit tokens: (\d+)'
     pat = re.compile(pattern)
-    
-    # Atomic counter starting at 0
+
     request_counter = 0
-    
+
     try:
         with open(err_file_path, 'r') as f:
             for line in f:
                 match = pat.search(line)
                 if match:
                     prefix_hit_tokens = int(match.group(1))
-                    prefix_cache_data[request_counter] = prefix_hit_tokens
+                    prefix_cache_data_by_pos[request_counter] = prefix_hit_tokens
                     request_counter += 1
     except FileNotFoundError:
         print(f"Warning: Could not find file {err_file_path}")
-        return {}
+        return {}, {}
     except Exception as e:
         print(f"Warning: Error reading {err_file_path}: {e}")
-        return {}
-    
-    if prefix_cache_data:
-        print(f"Extracted prefix cache data for {len(prefix_cache_data)} requests from {err_file_path}")
-    return prefix_cache_data
+        return {}, {}
+
+    if prefix_cache_data_by_pos:
+        print(f"Extracted prefix cache data for {len(prefix_cache_data_by_pos)} requests from {err_file_path}")
+    return {}, prefix_cache_data_by_pos
 
 def extract_ttft_data(out_file_path):
     """
     Extract TTFT from the output log file.
-    Uses a monotonic counter (0-indexed) for alignment.
-    Supports two formats:
-    1. Full format: '[MOCK] Request N completed: ... TTFT: X.XXs Speedup: X.XXx'
-    2. Fallback format: '[INFO] TTFT: X.XX seconds'
-    
+
+    Captures the optional ``(req_id=...)`` marker the server now appends to
+    ``[MOCK] Request N completed`` and ``[INFO] TTFT: ... seconds`` so
+    downstream joins can key on the stable content hash. Falls back to a
+    positional counter for logs that predate the change.
+
     Args:
         out_file_path (str): Path to the .out file
-        
+
     Returns:
-        dict: Dictionary mapping request index (0-indexed) to ttft
+        tuple: (ttft_data_by_id, ttft_data_by_pos)
     """
-    ttft_data = {}
-    
-    # Primary pattern: Full format with [MOCK] Request and Speedup
-    primary_pattern = r'@@@@@ Response # of choices: (\d+)\s*\[MOCK\] Request (\d+) completed:.*?TTFT: ([0-9.]+)s\s*Speedup: ([0-9.]+)x'
+    ttft_data_by_id = {}
+    ttft_data_by_pos = {}
+
+    primary_pattern = (
+        r'@@@@@ Response # of choices: (\d+)\s*'
+        r'\[MOCK\] Request (\d+) completed(?:\s*\(req_id=([^)]+)\))?:'
+        r'.*?TTFT: ([0-9.]+)s\s*Speedup: ([0-9.]+)x'
+    )
     primary_pat = re.compile(primary_pattern, re.DOTALL)
-    
-    # Fallback pattern: Just TTFT line (format: [INFO] TTFT: X.XX seconds)
-    fallback_pattern = r'\[INFO\] TTFT: ([0-9.]+) seconds'
+
+    fallback_pattern = r'\[INFO\] TTFT: ([0-9.]+) seconds(?:\s*\(req_id=([^)]+)\))?'
     fallback_pat = re.compile(fallback_pattern)
-    
-    # Monotonic counter starting at 0
+
     request_counter = 0
-    
+
     try:
         with open(out_file_path, 'r') as f:
             content = f.read()
-            
-            # Try primary pattern first
+
             primary_matches = primary_pat.findall(content)
             used_fallback = False
-            
+
             if primary_matches:
                 for match in primary_matches:
-                    ttft = float(match[2])
-                    ttft_data[request_counter] = ttft
+                    req_id_str = (match[2] or "").strip() or None
+                    ttft = float(match[3])
+                    if req_id_str:
+                        ttft_data_by_id[req_id_str] = ttft
+                    ttft_data_by_pos[request_counter] = ttft
                     request_counter += 1
             else:
-                # Fallback: Extract just TTFT lines
                 used_fallback = True
                 fallback_matches = fallback_pat.findall(content)
                 for match in fallback_matches:
-                    ttft = float(match)
-                    ttft_data[request_counter] = ttft
+                    ttft = float(match[0])
+                    req_id_str = (match[1] or "").strip() or None
+                    if req_id_str:
+                        ttft_data_by_id[req_id_str] = ttft
+                    ttft_data_by_pos[request_counter] = ttft
                     request_counter += 1
-                
+
     except FileNotFoundError:
         print(f"Error: Could not find file {out_file_path}")
-        return {}
+        return {}, {}
     except Exception as e:
         print(f"Error reading {out_file_path}: {e}")
-        return {}
-    
-    print(f"Extracted TTFT data for {len(ttft_data)} requests from {out_file_path}")
+        return {}, {}
+
+    print(f"Extracted TTFT data for {len(ttft_data_by_pos)} requests from {out_file_path}"
+          f" ({len(ttft_data_by_id)} unique req_ids)")
     if used_fallback:
         print(f"  Note: Used fallback pattern")
-    return ttft_data
+    return ttft_data_by_id, ttft_data_by_pos
+
+
+def _select_join_view(left, right):
+    """Pick the strongest join between two ``(by_id, by_pos)`` tuples.
+
+    Returns ``(left_view, right_view, mode)``. ``mode`` is ``"req_id"`` if
+    both sides have overlapping stable hashes, else ``"position"``.
+    """
+    left_by_id, left_by_pos = left
+    right_by_id, right_by_pos = right
+
+    if left_by_id and right_by_id:
+        if set(left_by_id) & set(right_by_id):
+            return left_by_id, right_by_id, "req_id"
+        print("Warning: both sides have req_ids but they do not overlap; "
+              "falling back to positional join.")
+    return left_by_pos, right_by_pos, "position"
+
+
+def _sorted_common_ids(view_a, view_b):
+    common = set(view_a.keys()) & set(view_b.keys())
+    # Ints come first (positional), then strings, each sorted internally.
+    return sorted(common, key=lambda k: (isinstance(k, str), k))
+
 
 def correlate_lmcache_data(cache_data, ttft_data):
     """
-    Correlate cache data with TTFT data based on request indices.
-    
-    Args:
-        cache_data (dict): Cache hit data from error log (may be empty)
-        ttft_data (dict): TTFT data from output log
-        
+    Correlate cache data with TTFT data.
+
+    Both arguments are ``(by_id, by_pos)`` tuples. Joins on stable req_id
+    strings when both sides have them; otherwise falls back to positional.
+
     Returns:
         tuple: (hit_ratios, request_ids, total_tokens_list, hit_tokens_list, ttfts)
-               Returns empty lists for cache-related data if cache_data is empty
     """
     hit_ratios = []
     request_ids = []
     total_tokens_list = []
     hit_tokens_list = []
     ttfts = []
-    
+
+    cache_by_id, cache_by_pos = cache_data
+    ttft_by_id, ttft_by_pos = ttft_data
+
     # If no cache data, just return TTFT data
-    if not cache_data:
-        for req_id in sorted(ttft_data.keys()):
-            ttft = ttft_data[req_id]
-            ttfts.append(ttft)
+    if not cache_by_id and not cache_by_pos:
+        # Prefer req_id keys if present
+        view = ttft_by_id if ttft_by_id else ttft_by_pos
+        for req_id in sorted(view.keys(), key=lambda k: (isinstance(k, str), k)):
+            ttfts.append(view[req_id])
             request_ids.append(req_id)
         return [], request_ids, [], [], ttfts
-    
-    # Find common request IDs between the two datasets
-    common_ids = set(cache_data.keys()) & set(ttft_data.keys())
-    
+
+    cache_view, ttft_view, mode = _select_join_view(cache_data, ttft_data)
+    common_ids = _sorted_common_ids(cache_view, ttft_view)
+
     if not common_ids:
         print("Warning: No matching request IDs found between cache and TTFT data")
         return [], [], [], [], []
-    
-    print(f"Found {len(common_ids)} matching request IDs")
-    
-    for req_id in sorted(common_ids):
-        total_tokens, hit_tokens = cache_data[req_id]
-        ttft = ttft_data[req_id]
-        
-        # Calculate hit ratio (hit tokens / total tokens)
+
+    print(f"Found {len(common_ids)} matching request IDs (join mode: {mode})")
+
+    for req_id in common_ids:
+        total_tokens, hit_tokens = cache_view[req_id]
+        ttft = ttft_view[req_id]
+
         hit_ratio = hit_tokens / total_tokens if total_tokens > 0 else 0
-        
+
         hit_ratios.append(hit_ratio)
         request_ids.append(req_id)
         total_tokens_list.append(total_tokens)
         hit_tokens_list.append(hit_tokens)
         ttfts.append(ttft)
-    
+
     return hit_ratios, request_ids, total_tokens_list, hit_tokens_list, ttfts
 
 def calculate_speedup_comparison(run1_ttft_data, run2_ttft_data):
     """
     Calculate speedup by comparing TTFT between two runs.
     Speedup = run2_ttft / run1_ttft (higher means run1 is faster)
-    
-    Args:
-        run1_ttft_data (dict): TTFT data from first run
-        run2_ttft_data (dict): TTFT data from second run (baseline)
-        
+
+    Both arguments are ``(by_id, by_pos)`` tuples from :func:`extract_ttft_data`.
+    Joins on stable req_id strings whenever both runs have them so a slow
+    request in run1 can be directly compared to the same request in run2
+    even if the two runs completed their requests in different orders.
+
     Returns:
-        tuple: (request_ids, speedups, run1_ttfts, run2_ttfts) for requests with both data
+        tuple: (request_ids, speedups, run1_ttfts, run2_ttfts)
     """
-    # Find common request IDs
-    common_ids = set(run1_ttft_data.keys()) & set(run2_ttft_data.keys())
-    
+    run1_view, run2_view, mode = _select_join_view(run1_ttft_data, run2_ttft_data)
+    common_ids = _sorted_common_ids(run1_view, run2_view)
+
     if not common_ids:
         print("Warning: No matching request IDs found between the two runs")
         return [], [], [], []
-    
-    print(f"Found {len(common_ids)} matching request IDs for TTFT comparison")
-    
+
+    print(f"Found {len(common_ids)} matching request IDs for TTFT comparison (join mode: {mode})")
+
     request_ids = []
     speedups = []
     run1_ttfts = []
     run2_ttfts = []
-    
-    for req_id in sorted(common_ids):
-        run1_ttft = run1_ttft_data[req_id]
-        run2_ttft = run2_ttft_data[req_id]
-        
+
+    for req_id in common_ids:
+        run1_ttft = run1_view[req_id]
+        run2_ttft = run2_view[req_id]
+
         # Calculate speedup: run2_ttft / run1_ttft
         # Higher values mean run1 is faster (better)
         if run1_ttft > 0 and run2_ttft > 0:
             speedup = run2_ttft / run1_ttft
         else:
             continue
-        
+
         request_ids.append(req_id)
         speedups.append(speedup)
         run1_ttfts.append(run1_ttft)
         run2_ttfts.append(run2_ttft)
-    
+
     return request_ids, speedups, run1_ttfts, run2_ttfts
 
 def create_ttft_comparison_scatter(run1_ttfts, run2_ttfts, request_ids,
@@ -459,33 +501,45 @@ def create_speedup_histogram(speedups, run1_label="Run 1", run2_label="Run 2 (Ba
         plt.show()
     plt.close()
 
-def detect_outliers(speedups, threshold_multiplier=1.5):
+def detect_outliers(speedups, threshold_multiplier=1.5, include_under=False):
     """
-    Detect outliers in speedup values using IQR method.
-    Returns indices of outliers (extremely good speedup values).
-    
+    Detect speedup outliers using the IQR method.
+
+    When ``include_under`` is False (default for legacy callers) only the
+    high tail — extremely good speedup — is returned. When True, the low
+    tail (Q1 - k*IQR) is also returned, tagged so callers can separate
+    over-performers from under-performers.
+
     Args:
         speedups (list): List of speedup values
         threshold_multiplier (float): Multiplier for IQR threshold (default: 1.5)
-        
+        include_under (bool): Also detect under-performers.
+
     Returns:
-        list: Indices of outlier values
+        If ``include_under`` is False: list of indices (upper-tail only).
+        If ``include_under`` is True: list of (index, "over"|"under") tuples.
     """
     if len(speedups) < 4:
-        return []
-    
+        return [] if not include_under else []
+
     speedups_array = np.array(speedups)
     q1 = np.percentile(speedups_array, 25)
     q3 = np.percentile(speedups_array, 75)
     iqr = q3 - q1
-    
-    # Upper bound for outliers (extremely good speedup)
+
     upper_bound = q3 + threshold_multiplier * iqr
-    
-    # Find indices where speedup is above upper bound
-    outlier_indices = np.where(speedups_array > upper_bound)[0].tolist()
-    
-    return outlier_indices
+    lower_bound = q1 - threshold_multiplier * iqr
+
+    upper_idx = np.where(speedups_array > upper_bound)[0].tolist()
+
+    if not include_under:
+        return upper_idx
+
+    lower_idx = np.where(speedups_array < lower_bound)[0].tolist()
+    # Sorted by index so the two classes interleave in natural request order.
+    tagged = [(i, "over") for i in upper_idx] + [(i, "under") for i in lower_idx]
+    tagged.sort(key=lambda t: t[0])
+    return tagged
 
 def filter_outliers(speedups, *arrays, threshold_multiplier=1.5):
     """
@@ -503,6 +557,239 @@ def filter_outliers(speedups, *arrays, threshold_multiplier=1.5):
     print(f"  Removed {removed} outlier(s) for no-outlier plots "
           f"(threshold: {threshold_multiplier}x IQR)")
     return filtered
+
+
+def load_profile_records(profile_file):
+    """Load an LMCache profiler JSONL file into ``{req_id: [records]}``.
+
+    Each record is a dict of the form emitted by ``lmcache/v1/profiling.py``:
+    ``{"op": ..., "req_id": ..., "phases": {...}, "wall_ts": ..., ...}``.
+    Records without a ``req_id`` field (orphaned phases, legacy logs) are
+    collected under the ``None`` key so callers can still count them.
+    """
+    by_req_id = defaultdict(list)
+    if profile_file is None:
+        return by_req_id
+    path = Path(profile_file).expanduser()
+    if not path.exists():
+        print(f"  Warning: profile file not found: {path}")
+        return by_req_id
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                by_req_id[rec.get("req_id")].append(rec)
+    except Exception as e:
+        print(f"  Warning: failed to read profile file {path}: {e}")
+    return by_req_id
+
+
+def _phase_medians(records_by_req_id):
+    """Build ``{(op, phase): median_ms}`` across every request in a run.
+
+    Used as a comparison baseline so outlier phases get flagged with a
+    ratio-to-median marker, turning the per-outlier report from "here are
+    some numbers" into "here is where this request diverges from the rest".
+    """
+    buckets = defaultdict(list)
+    for req_id, recs in records_by_req_id.items():
+        if req_id is None:
+            continue
+        for rec in recs:
+            op = rec.get("op", "unknown")
+            for phase, ms in rec.get("phases", {}).items():
+                buckets[(op, phase)].append(ms)
+    return {k: float(np.median(v)) for k, v in buckets.items() if v}
+
+
+def _aggregate_op_totals(records):
+    """Group a list of records by ``op``, summing phase totals per group.
+
+    Returns a list of ``(op, total_ms, record_count, phase_dict)`` tuples
+    sorted by total descending so the biggest contributors land on top of
+    the per-outlier report.
+    """
+    grouped = defaultdict(lambda: {"total": 0.0, "count": 0, "phases": defaultdict(float), "phase_counts": defaultdict(int)})
+    for rec in records:
+        op = rec.get("op", "unknown")
+        phases = rec.get("phases", {})
+        rec_total = sum(phases.values())
+        grouped[op]["total"] += rec_total
+        grouped[op]["count"] += 1
+        for phase, ms in phases.items():
+            grouped[op]["phases"][phase] += ms
+            grouped[op]["phase_counts"][phase] += 1
+    out = []
+    for op, data in grouped.items():
+        out.append((op, data["total"], data["count"], dict(data["phases"]), dict(data["phase_counts"])))
+    out.sort(key=lambda t: t[1], reverse=True)
+    return out
+
+
+def _format_phase_line(op, phase, summed_ms, phase_count, medians):
+    """Build the phase row, annotating with a ratio-to-median marker.
+
+    Because a single request can produce several records of the same op
+    (e.g. per-layer store), we report ``sum`` and ``avg`` on the phase and
+    compare ``avg`` to the run-wide median for that (op, phase).
+    """
+    avg = summed_ms / phase_count if phase_count else summed_ms
+    median = medians.get((op, phase))
+    marker = ""
+    if median and median > 0:
+        ratio = avg / median
+        if ratio >= 1.5:
+            marker = f"  [x{ratio:.2f} vs median {median:.2f}ms]   <<< HOT"
+        elif ratio <= 0.5:
+            marker = f"  [x{ratio:.2f} vs median {median:.2f}ms]   (cold)"
+        else:
+            marker = f"  (median {median:.2f}ms)"
+    if phase_count > 1:
+        return (f"      {phase:<40} sum={summed_ms:9.2f}ms "
+                f"avg={avg:8.2f}ms (n={phase_count}){marker}")
+    return f"      {phase:<40} {summed_ms:9.2f}ms{marker}"
+
+
+def write_outlier_profile_report(
+    tagged_outliers,
+    request_ids,
+    speedups,
+    run1_ttfts,
+    run2_ttfts,
+    hit_ratios,
+    total_tokens,
+    hit_tokens,
+    run1_records_by_id,
+    run2_records_by_id,
+    run1_label,
+    run2_label,
+    output_dir,
+    iqr_threshold,
+):
+    """Write a per-outlier profiler breakdown keyed by stable req_id.
+
+    Produces ``speedup_outliers_profile.txt`` in ``output_dir``. For each
+    outlier (good or bad) the report prints the speedup / TTFT / cache
+    summary followed by the op/phase breakdown from the supplied profile
+    JSONL files. Phases whose average is >=1.5x the run-wide median get a
+    ``<<< HOT`` marker so bottlenecks in outliers are immediately visible.
+    """
+    if not tagged_outliers:
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+    out_file = output_dir / "speedup_outliers_profile.txt"
+
+    has_cache = bool(hit_ratios)
+
+    run1_medians = _phase_medians(run1_records_by_id)
+    run2_medians = _phase_medians(run2_records_by_id)
+
+    run1_total_records = sum(len(v) for k, v in run1_records_by_id.items() if k is not None)
+    run2_total_records = sum(len(v) for k, v in run2_records_by_id.items() if k is not None)
+    run1_orphan = len(run1_records_by_id.get(None, []))
+    run2_orphan = len(run2_records_by_id.get(None, []))
+
+    over_count = sum(1 for _, cls in tagged_outliers if cls == "over")
+    under_count = sum(1 for _, cls in tagged_outliers if cls == "under")
+
+    with open(out_file, "w") as f:
+        f.write("=" * 100 + "\n")
+        f.write("SPEEDUP OUTLIER PROFILE REPORT\n")
+        f.write("=" * 100 + "\n\n")
+        f.write(f"Speedup definition: {run2_label} TTFT / {run1_label} TTFT\n")
+        f.write(f"IQR threshold multiplier: {iqr_threshold}\n")
+        f.write(f"Over-performers (upper tail): {over_count}\n")
+        f.write(f"Under-performers (lower tail): {under_count}\n\n")
+        f.write(
+            f"run1 profile records loaded: {run1_total_records}"
+            f" (orphaned without req_id: {run1_orphan})\n"
+        )
+        f.write(
+            f"run2 profile records loaded: {run2_total_records}"
+            f" (orphaned without req_id: {run2_orphan})\n"
+        )
+        f.write("\n")
+        f.write(
+            "Phase rows annotated with '<<< HOT' are >=1.5x the run-wide "
+            "median for that (op, phase) pair -- likely bottleneck driver.\n"
+        )
+        f.write(
+            "Phase rows with 'sum/avg (n=...)' summarise multiple records of\n"
+            "the same op type (e.g. per-layer store/retrieve) for this request.\n"
+        )
+        f.write("\n" + "=" * 100 + "\n\n")
+
+        for idx, cls in tagged_outliers:
+            req_id = request_ids[idx]
+            ttft1 = run1_ttfts[idx]
+            ttft2 = run2_ttfts[idx]
+            speedup = speedups[idx]
+
+            label = "OVER-PERFORMER" if cls == "over" else "UNDER-PERFORMER"
+            f.write("-" * 100 + "\n")
+            f.write(f"REQUEST: {req_id}    [{label}]\n")
+            f.write("-" * 100 + "\n")
+            f.write(f"  {run1_label} TTFT: {ttft1:.6f} s\n")
+            f.write(f"  {run2_label} TTFT: {ttft2:.6f} s\n")
+            f.write(f"  Speedup: {speedup:.4f}x  ({((speedup - 1.0) * 100):+.2f}% vs run2)\n")
+
+            if has_cache and idx < len(hit_ratios):
+                f.write(
+                    f"  Cache hit ratio: {hit_ratios[idx]:.4f}"
+                )
+                if total_tokens and idx < len(total_tokens):
+                    f.write(f"   total_tokens={total_tokens[idx]}")
+                if hit_tokens and idx < len(hit_tokens):
+                    f.write(f"   hit_tokens={hit_tokens[idx]}")
+                f.write("\n")
+
+            f.write("\n")
+            for run_label, records_by_id, medians in (
+                (run1_label, run1_records_by_id, run1_medians),
+                (run2_label, run2_records_by_id, run2_medians),
+            ):
+                f.write(f"  Profile breakdown [{run_label}]\n")
+                recs = records_by_id.get(req_id)
+                if not recs:
+                    if not records_by_id:
+                        f.write("    (no profile file provided for this run)\n\n")
+                    else:
+                        f.write(f"    (no profiler records found for req_id={req_id})\n\n")
+                    continue
+
+                ops = _aggregate_op_totals(recs)
+                req_total = sum(t for _, t, _, _, _ in ops)
+                f.write(
+                    f"    records for this req_id: {len(recs)}  |  "
+                    f"summed phase time: {req_total:.2f} ms\n"
+                )
+                for op, total, n, phases, phase_counts in ops:
+                    f.write(
+                        f"    Op {op:<32} n={n:<3} "
+                        f"total={total:9.2f} ms\n"
+                    )
+                    for phase, summed_ms in sorted(phases.items(), key=lambda kv: kv[1], reverse=True):
+                        pc = phase_counts.get(phase, 1)
+                        f.write(
+                            _format_phase_line(op, phase, summed_ms, pc, medians) + "\n"
+                        )
+                f.write("\n")
+
+        f.write("=" * 100 + "\n")
+
+    print(f"\nOutlier profile report written to {out_file}")
+    print(
+        f"  {over_count} over-performer(s), {under_count} under-performer(s); "
+        f"run1 recs={run1_total_records}, run2 recs={run2_total_records}"
+    )
 
 
 def write_outlier_details(outlier_indices, request_ids, run1_ttfts, run2_ttfts,
@@ -590,6 +877,12 @@ def main():
                             '(outliers removed using IQR method on speedup)')
     parser.add_argument('--outlier-threshold', type=float, default=1.5,
                        help='IQR multiplier for outlier detection (default: 1.5)')
+    parser.add_argument('--run1-profile-file', default=None,
+                       help='Path to run1 LMCache profiler JSONL '
+                            '(enables per-outlier phase breakdown)')
+    parser.add_argument('--run2-profile-file', default=None,
+                       help='Path to run2 LMCache profiler JSONL '
+                            '(enables per-outlier phase breakdown)')
 
     args = parser.parse_args()
     
@@ -611,16 +904,22 @@ def main():
     print(f"  Output log: {run2_out_file}")
     print()
     
-    # Extract data
-    run1_cache_data = extract_cache_data(run1_err_file) if run1_err_file else {}
+    # Extract data. All extractors return (by_id, by_pos) tuples so
+    # downstream joins can prefer stable content-derived req_id strings
+    # and fall back to positional alignment for legacy logs.
+    empty = ({}, {})
+    run1_cache_data = extract_cache_data(run1_err_file) if run1_err_file else empty
     run1_ttft_data = extract_ttft_data(run1_out_file)
-    run2_cache_data = extract_cache_data(run2_err_file) if run2_err_file else {}
+    run2_cache_data = extract_cache_data(run2_err_file) if run2_err_file else empty
     run2_ttft_data = extract_ttft_data(run2_out_file)
-    
+
     # Extract prefix cache data from run2 (only available in runs with prefix cache stats enabled)
-    run2_prefix_cache_data = extract_prefix_cache_data(run2_err_file) if run2_err_file else {}
-    
-    if not run1_ttft_data or not run2_ttft_data:
+    run2_prefix_cache_data = extract_prefix_cache_data(run2_err_file) if run2_err_file else empty
+
+    def _empty_tuple(t):
+        return not t[0] and not t[1]
+
+    if _empty_tuple(run1_ttft_data) or _empty_tuple(run2_ttft_data):
         print("Failed to extract TTFT data from one or both output files. Exiting.")
         return
     
@@ -637,6 +936,17 @@ def main():
     if not speedups:
         print("No matching TTFT data found between runs. Exiting.")
         return
+
+    # Build run1 cache lookup keyed by whichever ID flavour correlate returned.
+    # This replaces the old pattern of treating ``req_id`` as a positional
+    # index into the cache arrays, which no longer holds when IDs are stable
+    # content hashes coming from run1's .err log.
+    run1_hit_ratio_map = dict(zip(run1_request_ids, run1_hit_ratios)) if run1_hit_ratios else {}
+    run1_total_tokens_map = dict(zip(run1_request_ids, run1_total_tokens)) if run1_total_tokens else {}
+    run1_hit_tokens_map = dict(zip(run1_request_ids, run1_hit_tokens)) if run1_hit_tokens else {}
+
+    def _aligned_hit_ratios(ids):
+        return [run1_hit_ratio_map.get(rid, 0) for rid in ids]
     
     # Print summary statistics
     print("\nData Summary:")
@@ -677,19 +987,29 @@ def main():
     extra_hit_ratios = []
     extra_hit_request_ids = []
     extra_hit_speedups = []
-    
-    if run1_cache_data and run2_prefix_cache_data:
+
+    # Prefix cache data is position-only (the [INFO] Prefix cache hit tokens
+    # log line carries no req_id), so the extra-hit join stays positional.
+    run1_cache_view = run1_cache_data[1]
+    run2_prefix_view = run2_prefix_cache_data[1]
+
+    if run1_cache_view and run2_prefix_view:
         print(f"\nCalculating extra cache hit ratios...")
-        print(f"  Run 1 (blend) cache entries: {len(run1_cache_data)}")
-        print(f"  Run 2 (prefix cache) entries: {len(run2_prefix_cache_data)}")
-        
-        # Find common request IDs across all three datasets
-        common_ids = set(run1_cache_data.keys()) & set(run2_prefix_cache_data.keys()) & set(speedup_request_ids)
+        print(f"  Run 1 (blend) cache entries: {len(run1_cache_view)}")
+        print(f"  Run 2 (prefix cache) entries: {len(run2_prefix_view)}")
+
+        # Positional join; speedup_request_ids may be either string or int.
+        # Only intersect with speedup ids when they are positional ints
+        # (matching the join mode extra-hit relies on).
+        speedup_set = set(
+            r for r in speedup_request_ids if isinstance(r, int)
+        ) or set(range(len(speedup_request_ids)))
+        common_ids = set(run1_cache_view.keys()) & set(run2_prefix_view.keys()) & speedup_set
         print(f"  Common request IDs: {len(common_ids)}")
-        
+
         for req_id in sorted(common_ids):
-            total_tokens, blend_hit_tokens = run1_cache_data[req_id]
-            prefix_hit_tokens = run2_prefix_cache_data[req_id]
+            total_tokens, blend_hit_tokens = run1_cache_view[req_id]
+            prefix_hit_tokens = run2_prefix_view[req_id]
             
             # Extra hit ratio = (blend_hits - prefix_hits) / total_tokens
             if total_tokens > 0:
@@ -713,40 +1033,60 @@ def main():
                 extra_correlation = np.corrcoef(extra_hit_ratios, extra_hit_speedups)[0, 1]
                 print(f"  Correlation with speedup: {extra_correlation:.3f}")
     
-    # Detect and write outlier details
-    outlier_indices = detect_outliers(speedups)
-    if outlier_indices and args.output_dir:
-        # Create mappings from request_id to cache data for run1
-        run1_cache_map = {}
-        if run1_hit_ratios and len(run1_hit_ratios) > 0 and len(run1_request_ids) == len(run1_hit_ratios):
-            for i, req_id in enumerate(run1_request_ids):
-                run1_cache_map[req_id] = {
-                    'hit_ratio': run1_hit_ratios[i],
-                    'total_tokens': run1_total_tokens[i] if i < len(run1_total_tokens) else 0,
-                    'hit_tokens': run1_hit_tokens[i] if i < len(run1_hit_tokens) else 0
-                }
-        
-        # Align cache data with speedups for outlier reporting
-        aligned_hit_ratios = []
-        aligned_total_tokens = []
-        aligned_hit_tokens = []
-        
-        for req_id in speedup_request_ids:
-            if req_id in run1_cache_map:
-                aligned_hit_ratios.append(run1_cache_map[req_id]['hit_ratio'])
-                aligned_total_tokens.append(run1_cache_map[req_id]['total_tokens'])
-                aligned_hit_tokens.append(run1_cache_map[req_id]['hit_tokens'])
-            else:
-                aligned_hit_ratios.append(0)
-                aligned_total_tokens.append(0)
-                aligned_hit_tokens.append(0)
-        
-        write_outlier_details(
-            outlier_indices, speedup_request_ids, run1_ttfts_common, run2_ttfts_common,
-            speedups, aligned_hit_ratios, aligned_total_tokens, aligned_hit_tokens,
-            args.run1_label, args.run2_label, args.output_dir)
-    elif outlier_indices:
-        print(f"\nWarning: {len(outlier_indices)} outliers detected but no output directory specified.")
+    # Detect and write outlier details. The legacy .txt keeps the upper-tail
+    # report that existing thesis artifacts depend on; the new profile-aware
+    # report walks BOTH tails (over- and under-performers) and joins them
+    # against the LMCache profiler JSONL files so each outlier gets a
+    # phase-level breakdown rather than just speedup/TTFT numbers.
+    outlier_indices = detect_outliers(speedups, args.outlier_threshold)
+    tagged_outliers = detect_outliers(
+        speedups, args.outlier_threshold, include_under=True
+    )
+
+    if tagged_outliers and args.output_dir:
+        # Align cache data with speedups for outlier reporting, using the
+        # map-based lookups that work for both stable-id and positional runs.
+        aligned_hit_ratios = [run1_hit_ratio_map.get(rid, 0) for rid in speedup_request_ids]
+        aligned_total_tokens = [run1_total_tokens_map.get(rid, 0) for rid in speedup_request_ids]
+        aligned_hit_tokens = [run1_hit_tokens_map.get(rid, 0) for rid in speedup_request_ids]
+
+        # Legacy upper-tail-only text file (preserved for existing artifacts)
+        if outlier_indices:
+            write_outlier_details(
+                outlier_indices, speedup_request_ids, run1_ttfts_common, run2_ttfts_common,
+                speedups, aligned_hit_ratios, aligned_total_tokens, aligned_hit_tokens,
+                args.run1_label, args.run2_label, args.output_dir)
+
+        # New two-tailed profiler-aware report
+        run1_records_by_id = load_profile_records(args.run1_profile_file)
+        run2_records_by_id = load_profile_records(args.run2_profile_file)
+        if not run1_records_by_id and not run2_records_by_id:
+            print("\nNote: no --run1-profile-file / --run2-profile-file given. "
+                  "Outlier report will still be written, but without phase breakdowns. "
+                  "Pass the LMCACHE_PROFILE_OUTPUT JSONL path(s) to get them.")
+        write_outlier_profile_report(
+            tagged_outliers=tagged_outliers,
+            request_ids=speedup_request_ids,
+            speedups=speedups,
+            run1_ttfts=run1_ttfts_common,
+            run2_ttfts=run2_ttfts_common,
+            hit_ratios=aligned_hit_ratios,
+            total_tokens=aligned_total_tokens,
+            hit_tokens=aligned_hit_tokens,
+            run1_records_by_id=run1_records_by_id,
+            run2_records_by_id=run2_records_by_id,
+            run1_label=args.run1_label,
+            run2_label=args.run2_label,
+            output_dir=args.output_dir,
+            iqr_threshold=args.outlier_threshold,
+        )
+    elif tagged_outliers:
+        over = sum(1 for _, c in tagged_outliers if c == "over")
+        under = sum(1 for _, c in tagged_outliers if c == "under")
+        print(
+            f"\nWarning: {over} over-performer and {under} under-performer "
+            f"outliers detected but no output directory specified."
+        )
         print("  Specify --output-dir to save outlier details.")
     
     # Create plots
@@ -768,14 +1108,8 @@ def main():
             
             # Cache-related plots (only if cache data exists)
             if run1_hit_ratios and len(run1_hit_ratios) > 0:
-                # Align hit ratios with speedups
-                aligned_hit_ratios = []
-                for req_id in speedup_request_ids:
-                    if req_id < len(run1_hit_ratios):
-                        aligned_hit_ratios.append(run1_hit_ratios[req_id])
-                    else:
-                        aligned_hit_ratios.append(0)
-                
+                aligned_hit_ratios = _aligned_hit_ratios(speedup_request_ids)
+
                 if len(aligned_hit_ratios) == len(speedups):
                     create_speedup_vs_hit_ratio_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids,
@@ -801,13 +1135,8 @@ def main():
                 pdf_dir / 'speedup_histogram.pdf')
             
             if run1_hit_ratios and len(run1_hit_ratios) > 0:
-                aligned_hit_ratios = []
-                for req_id in speedup_request_ids:
-                    if req_id < len(run1_hit_ratios):
-                        aligned_hit_ratios.append(run1_hit_ratios[req_id])
-                    else:
-                        aligned_hit_ratios.append(0)
-                
+                aligned_hit_ratios = _aligned_hit_ratios(speedup_request_ids)
+
                 if len(aligned_hit_ratios) == len(speedups):
                     create_speedup_vs_hit_ratio_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids,
@@ -846,10 +1175,7 @@ def main():
                         dest / f'speedup_histogram_no_outlier{ext}')
 
                     if run1_hit_ratios and len(run1_hit_ratios) > 0:
-                        f_aligned = [
-                            run1_hit_ratios[rid] if rid < len(run1_hit_ratios) else 0
-                            for rid in f_ids
-                        ]
+                        f_aligned = _aligned_hit_ratios(f_ids)
                         if len(f_aligned) == len(f_speedups):
                             create_speedup_vs_hit_ratio_plot(
                                 f_speedups, f_aligned, f_ids,
@@ -890,12 +1216,7 @@ def main():
             create_speedup_histogram(speedups, args.run1_label, args.run2_label)
 
             if run1_hit_ratios and len(run1_hit_ratios) > 0:
-                aligned_hit_ratios = []
-                for req_id in speedup_request_ids:
-                    if req_id < len(run1_hit_ratios):
-                        aligned_hit_ratios.append(run1_hit_ratios[req_id])
-                    else:
-                        aligned_hit_ratios.append(0)
+                aligned_hit_ratios = _aligned_hit_ratios(speedup_request_ids)
 
                 if len(aligned_hit_ratios) == len(speedups):
                     create_speedup_vs_hit_ratio_plot(
@@ -923,10 +1244,7 @@ def main():
                     f_speedups, args.run1_label, args.run2_label)
 
                 if run1_hit_ratios and len(run1_hit_ratios) > 0:
-                    f_aligned = [
-                        run1_hit_ratios[rid] if rid < len(run1_hit_ratios) else 0
-                        for rid in f_ids
-                    ]
+                    f_aligned = _aligned_hit_ratios(f_ids)
                     if len(f_aligned) == len(f_speedups):
                         create_speedup_vs_hit_ratio_plot(
                             f_speedups, f_aligned, f_ids)
@@ -962,13 +1280,7 @@ def main():
         })
         
         if run1_hit_ratios and len(run1_hit_ratios) > 0:
-            aligned_hit_ratios = []
-            for req_id in speedup_request_ids:
-                if req_id < len(run1_hit_ratios):
-                    aligned_hit_ratios.append(run1_hit_ratios[req_id])
-                else:
-                    aligned_hit_ratios.append(0)
-            df['Hit_Ratio'] = aligned_hit_ratios
+            df['Hit_Ratio'] = _aligned_hit_ratios(speedup_request_ids)
         
         # Add extra hit ratio data if available
         if extra_hit_ratios and len(extra_hit_ratios) > 0:
