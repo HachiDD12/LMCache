@@ -67,8 +67,10 @@ def setup_environment_variables(
     use_disk: bool = False, blend_special_str: str = " # # "
 ):
     """Setup environment variables for LMCache configuration"""
-    # LMCache is set to use 256 tokens per chunk
-    os.environ["LMCACHE_CHUNK_SIZE"] = "256"
+    # # LMCache is set to use 256 tokens per chunk
+    # os.environ["LMCACHE_CHUNK_SIZE"] = "256"
+    
+    # Let the run script set the chunk size
 
     # Blending related config
     os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
@@ -79,20 +81,20 @@ def setup_environment_variables(
         # Disable local CPU backend in LMCache
         os.environ["LMCACHE_LOCAL_CPU"] = "False"
 
-        # Set the maximum size of the local CPU buffer size to 5GB
+        # Set the maximum size of the local CPU buffer size to 40GB
         os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
         # Enable local disk backend in LMCache
-        os.environ["LMCACHE_LOCAL_DISK"] = "file://local_disk/"
+        os.environ["LMCACHE_LOCAL_DISK"] = "/data/user_data/zhuofanc/lmcache_disk/"
 
-        # Set the maximum size of the local disk size to 10GB
-        os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "10"
+        # Set the maximum size of the local disk size to 200GB
+        os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "200"
     else:
         # Enable local CPU backend in LMCache
         os.environ["LMCACHE_LOCAL_CPU"] = "True"
 
-        # Set the maximum size of the local CPU size to 5GB
-        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
+        # Set the maximum size of the local CPU size to 40GB
+        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "40"
 
 
 @contextlib.contextmanager
@@ -112,6 +114,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         tensor_parallel_size=4,         # TODO: add this back in once have 2 GPUs
         kv_transfer_config=ktc,
         max_model_len=128000,           # TODO: change this to 128000 once hosting devstral
+        max_num_batched_tokens=16384,
         gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
         seed=42,                        # For reproducibility
@@ -149,6 +152,7 @@ class BlendServer:
         self.min_chunk_size = min_chunk_size
         self.chunk_dist_file = chunk_dist_file
         self.chunk_sizes: List[int] = []  # Track chunk sizes for distribution
+        self.showed_sample_completion = False
         
         # Initialize prefix cache stats module if enabled
         if enable_prefix_cache_stats:
@@ -454,8 +458,13 @@ class BlendServer:
             print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
             # Extract generated text
             
-            # print(f"@@@@@ Outputs: {outputs}")
-            # print(f"@@@@@ Outputs[0]: {outputs[0]}")
+            # show sample completion syntax for debugging
+            # TODO: check if this has engine-specified request id, if so add to return
+            if not self.showed_sample_completion:
+                # print(f"@@@@@ Outputs: {outputs}")
+                # print(f"@@@@@ Outputs[0]: {outputs[0]}")
+                self.showed_sample_completion = True
+                print(f"@@@@@ Sample completion (for debugging): {outputs[0].outputs[0]}")
             
             choices = []
             for i, completion in enumerate(outputs[0].outputs):

@@ -335,6 +335,29 @@ class AllocatorBackendInterface(StorageBackendInterface):
         """
         raise NotImplementedError
 
+    def batched_allocate_varied(
+        self,
+        shapes: List[torch.Size],
+        dtype: torch.dtype,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[List[MemoryObj]]:
+        """
+        Allocate memory objects with potentially different shapes in one pass.
+        Default implementation falls back to individual allocate() calls.
+        Subclasses may override for bulk eviction optimization.
+        """
+        allocated: List[MemoryObj] = []
+        for shape in shapes:
+            obj = self.allocate(shape, dtype, fmt, eviction=eviction, busy_loop=busy_loop)
+            if obj is None:
+                for prev in allocated:
+                    prev.ref_count_down()
+                return None
+            allocated.append(obj)
+        return allocated
+
     def calculate_chunk_budget(self) -> int:
         """
         Calculate the chunk budget for the allocator backend.

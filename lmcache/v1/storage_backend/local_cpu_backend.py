@@ -155,13 +155,32 @@ class LocalCPUBackend(AllocatorBackendInterface):
     ) -> None:
         """
         Synchronously put the MemoryObjs into the local cpu backend.
+        Acquires cpu_lock once for the entire batch to avoid per-key overhead.
         """
         if not self.use_hot:
             return
 
-        # TODO(Jiayi): optimize this with batching
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(key, memory_obj)
+        admit_msgs = []
+        with self.cpu_lock:
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                if key in self.hot_cache:
+                    continue
+                memory_obj.ref_count_up()
+                self.hot_cache[key] = memory_obj
+                self.cache_policy.update_on_put(key)
+                if self.lmcache_worker is not None:
+                    admit_msgs.append(
+                        KVAdmitMsg(
+                            self.instance_id,
+                            key.worker_id,
+                            key.chunk_hash,
+                            str(self),
+                        )
+                    )
+
+        if self.lmcache_worker is not None:
+            for msg in admit_msgs:
+                self.lmcache_worker.put_msg(msg)
 
     def get_blocking(
         self,
@@ -304,6 +323,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 numa_mapping=numa_mapping,
             )
 
+    # Maximum number of busy-loop retries before giving up, to prevent
+    # deadlocks when all cache entries are pinned by concurrent lookups.
+    MAX_EVICTION_RETRIES = 100
+
     @_lmcache_nvtx_annotate
     def allocate(
         self,
@@ -337,7 +360,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         evict_keys_count = 0
         num_attempts = 0
-        while True:
+        while num_attempts < self.MAX_EVICTION_RETRIES:
             # whether or not this request needs to wait or other requests
             wait_other_requests = True
             if self.use_hot:
@@ -392,8 +415,87 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 " attempts of local cpu backend allocate()"
             )
 
+        if memory_obj is None:
+            logger.warning(
+                f"Failed to allocate memory after {num_attempts} eviction "
+                "retries. All cache entries may be pinned by concurrent "
+                "lookups. Giving up to avoid deadlock."
+            )
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_obj
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate_varied(
+        self,
+        shapes: List[torch.Size],
+        dtype: torch.dtype,
+        fmt: Optional[MemoryFormat] = None,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[List[MemoryObj]]:
+        """
+        Allocate memory objects with potentially different shapes in one pass.
+        Performs bulk eviction when memory is insufficient, avoiding the
+        per-chunk evict-one-retry-sleep pattern.
+
+        Returns None if allocation fails for any chunk (partial results are freed).
+        """
+        if not shapes:
+            return []
+
+        if fmt is None:
+            if self.layerwise:
+                fmt = MemoryFormat.KV_2TD if self.enable_blending else MemoryFormat.KV_T2D
+            else:
+                fmt = MemoryFormat.KV_2LTD
+
+        allocated: List[MemoryObj] = []
+        evict_keys_count = 0
+        num_attempts = 0
+
+        for shape in shapes:
+            memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
+            if memory_obj is not None:
+                allocated.append(memory_obj)
+                continue
+
+            if not eviction:
+                for obj in allocated:
+                    obj.ref_count_down()
+                return None
+
+            while memory_obj is None:
+                wait_other_requests = True
+                if self.use_hot:
+                    with self.cpu_lock:
+                        evict_keys = self.cache_policy.get_evict_candidates(
+                            self.hot_cache, num_candidates=4
+                        )
+                        if evict_keys:
+                            wait_other_requests = False
+                            self.batched_remove(evict_keys, force=False)
+                            evict_keys_count += len(evict_keys)
+                        else:
+                            self.stats_monitor.update_local_cpu_evict_failed_count(1)
+
+                if wait_other_requests:
+                    if not busy_loop:
+                        for obj in allocated:
+                            obj.ref_count_down()
+                        self.stats_monitor.update_local_cpu_evict_metrics(
+                            evict_keys_count
+                        )
+                        return None
+
+                    time.sleep(0.1)
+
+                memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
+                num_attempts += 1
+
+            allocated.append(memory_obj)
+
+        self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
+        return allocated
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
@@ -435,7 +537,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         evict_keys_count = 0
         num_attempts = 0
-        while True:
+        while num_attempts < self.MAX_EVICTION_RETRIES:
             wait_other_requests = True
             if self.use_hot:
                 # TODO(Jiayi): optimize `num_candidates` with estimation.
@@ -462,9 +564,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             # is not supported.
                             old_mem_objs = []
                             for key in evict_key_all_layer:
-                                old_mem_objs.append(self.hot_cache[key])
-                                self.cache_policy.update_on_force_evict(key)
-                                self.hot_cache.pop(key, None)
+                                mem_obj = self.hot_cache.get(key)
+                                if mem_obj is not None:
+                                    old_mem_objs.append(mem_obj)
+                                    self.cache_policy.update_on_force_evict(key)
+                                    self.hot_cache.pop(key, None)
 
                             self.memory_allocator.batched_free(old_mem_objs)
 
@@ -504,6 +608,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             logger.debug(
                 f"Unable to allocate memory object after {num_attempts}"
                 " attempts of local cpu backend batched_allocate()"
+            )
+        if not memory_objs:
+            logger.warning(
+                f"Failed to batched_allocate memory after {num_attempts} "
+                "eviction retries. All cache entries may be pinned by "
+                "concurrent lookups. Giving up to avoid deadlock."
             )
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_objs

@@ -110,9 +110,17 @@ class MemoryObjMetadata:
     # Positions when the cache is stored
     cached_positions: Optional[torch.Tensor] = None
 
+    # Original positions used for rotary embedding correction during load
+    old_positions: Optional[torch.Tensor] = None
+
     def to_dict(self):
         # Note(Kuntai): this is used for serializing MemoryObjMetadata via
-        # msgpack.
+        # msgpack. Tensors are stored as nested lists for portability.
+        def _tensor_to_list(t: Optional[torch.Tensor]) -> Optional[list]:
+            if t is None:
+                return None
+            return t.detach().cpu().tolist()
+
         return {
             "__type__": "MemoryObjMetadata",
             "shape": list(self.shape),  # torch.Size -> list
@@ -120,20 +128,53 @@ class MemoryObjMetadata:
             "address": self.address,
             "phy_size": self.phy_size,
             "ref_count": self.ref_count,
+            "pin_count": self.pin_count,
             "fmt": self.fmt.value,
+            "cached_positions": _tensor_to_list(self.cached_positions),
+            "old_positions": _tensor_to_list(self.old_positions),
         }
 
     @staticmethod
     def from_dict(d):
-        dtype_str = d["dtype"]
-        dtype = getattr(torch, dtype_str.replace("torch.", "")) if dtype_str else None
+        # Use .get() for backward compatibility with older on-disk / wire
+        # payloads that omit newer fields (avoids KeyError).
+        dtype_str = d.get("dtype")
+        dtype = None
+        if dtype_str:
+            dtype = getattr(torch, str(dtype_str).replace("torch.", ""), None)
+            if dtype is None:
+                logger.warning(
+                    "MemoryObjMetadata.from_dict: unknown dtype %s, using None",
+                    dtype_str,
+                )
+
+        fmt_val = d.get("fmt", MemoryFormat.UNDEFINED.value)
+        try:
+            fmt = MemoryFormat(int(fmt_val))
+        except (ValueError, TypeError):
+            fmt = MemoryFormat.UNDEFINED
+
+        def _list_to_int64_tensor(
+            raw: object,
+        ) -> Optional[torch.Tensor]:
+            if raw is None:
+                return None
+            return torch.tensor(raw, dtype=torch.int64)
+
+        shape_raw = d.get("shape")
+        if shape_raw is None:
+            raise KeyError("MemoryObjMetadata.from_dict requires 'shape'")
+
         return MemoryObjMetadata(
-            shape=torch.Size(d["shape"]),
+            shape=torch.Size(shape_raw),
             dtype=dtype,
-            address=d["address"],
-            phy_size=d["phy_size"],
-            ref_count=d["ref_count"],
-            fmt=MemoryFormat(d["fmt"]),
+            address=int(d.get("address", 0)),
+            phy_size=int(d.get("phy_size", 0)),
+            ref_count=int(d.get("ref_count", 0)),
+            pin_count=int(d.get("pin_count", 0)),
+            fmt=fmt,
+            cached_positions=_list_to_int64_tensor(d.get("cached_positions")),
+            old_positions=_list_to_int64_tensor(d.get("old_positions")),
         )
 
     def get_size(self) -> int:

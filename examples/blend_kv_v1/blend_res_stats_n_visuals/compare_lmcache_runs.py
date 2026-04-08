@@ -335,6 +335,38 @@ def create_speedup_vs_hit_ratio_plot(speedups, hit_ratios, request_ids, output_f
     plt.close()
 
 
+def create_speedup_vs_hit_ratio_log_plot(speedups, hit_ratios, request_ids, output_file=None):
+    """Create scatter plot of speedup vs hit ratio with log-scaled y axis."""
+    set_plot_fonts()
+    plt.figure(figsize=(12, 8))
+
+    plt.scatter(hit_ratios, speedups, alpha=0.7, s=50, c='darkgreen', edgecolors='black')
+
+    if len(hit_ratios) > 1:
+        z = np.polyfit(hit_ratios, speedups, 1)
+        p = np.poly1d(z)
+        plt.plot(hit_ratios, p(hit_ratios), "r--", alpha=0.8, linewidth=2,
+                label=f'Trend line (slope: {z[0]:.3f})')
+
+    plt.axhline(y=1.0, color='red', linestyle='-', alpha=0.7, linewidth=2,
+               label='No improvement (1.0x)')
+
+    plt.yscale('log')
+    plt.xlabel('Cache Hit Ratio (Hit Tokens / Total Tokens)', fontsize=24)
+    plt.ylabel('Speedup (Baseline TTFT / Run TTFT) (log scale)', fontsize=24)
+    plt.title('Speedup vs Cache Hit Ratio (Log Scale)', fontsize=28, fontweight='bold')
+    plt.grid(True, alpha=0.3, which='both')
+    plt.legend(fontsize=20)
+    plt.tight_layout()
+
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"Speedup vs hit ratio (log) plot saved to {output_file}")
+    else:
+        plt.show()
+    plt.close()
+
+
 def create_speedup_vs_extra_hit_ratio_plot(speedups, extra_hit_ratios, request_ids,
                                            run1_label="Run 1", run2_label="Run 2",
                                            output_file=None):
@@ -455,7 +487,25 @@ def detect_outliers(speedups, threshold_multiplier=1.5):
     
     return outlier_indices
 
-def write_outlier_details(outlier_indices, request_ids, run1_ttfts, run2_ttfts, 
+def filter_outliers(speedups, *arrays, threshold_multiplier=1.5):
+    """
+    Remove outlier entries (by speedup IQR) from speedups and any
+    parallel arrays.  Returns the filtered versions in the same order.
+    """
+    outlier_set = set(detect_outliers(speedups, threshold_multiplier))
+    if not outlier_set:
+        return (speedups, *arrays)
+    filtered = tuple(
+        [v for i, v in enumerate(a) if i not in outlier_set]
+        for a in (speedups, *arrays)
+    )
+    removed = len(outlier_set)
+    print(f"  Removed {removed} outlier(s) for no-outlier plots "
+          f"(threshold: {threshold_multiplier}x IQR)")
+    return filtered
+
+
+def write_outlier_details(outlier_indices, request_ids, run1_ttfts, run2_ttfts,
                          speedups, hit_ratios, total_tokens, hit_tokens,
                          run1_label, run2_label, output_dir):
     """
@@ -535,7 +585,12 @@ def main():
                        help='Directory to save all plots (optional)')
     parser.add_argument('--no-plot', action='store_true',
                        help='Skip plotting and only show data summary')
-    
+    parser.add_argument('--plot-no-outlier', action='store_true',
+                       help='Also plot no-outlier versions of all plots '
+                            '(outliers removed using IQR method on speedup)')
+    parser.add_argument('--outlier-threshold', type=float, default=1.5,
+                       help='IQR multiplier for outlier detection (default: 1.5)')
+
     args = parser.parse_args()
     
     # Expand user paths
@@ -725,7 +780,10 @@ def main():
                     create_speedup_vs_hit_ratio_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids,
                         output_dir / 'speedup_vs_hit_ratio.png')
-            
+                    create_speedup_vs_hit_ratio_log_plot(
+                        speedups, aligned_hit_ratios, speedup_request_ids,
+                        output_dir / 'speedup_vs_hit_ratio_log.png')
+
             # Extra cache hit ratio plot (blend vs prefix cache)
             if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
                 create_speedup_vs_extra_hit_ratio_plot(
@@ -754,7 +812,10 @@ def main():
                     create_speedup_vs_hit_ratio_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids,
                         pdf_dir / 'speedup_vs_hit_ratio.pdf')
-            
+                    create_speedup_vs_hit_ratio_log_plot(
+                        speedups, aligned_hit_ratios, speedup_request_ids,
+                        pdf_dir / 'speedup_vs_hit_ratio_log.pdf')
+
             # Extra cache hit ratio PDF plot
             if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
                 create_speedup_vs_extra_hit_ratio_plot(
@@ -762,6 +823,63 @@ def main():
                     args.run1_label, args.run2_label,
                     pdf_dir / 'speedup_vs_extra_hit_ratio.pdf')
             
+            # --- No-outlier versions ---
+            if args.plot_no_outlier:
+                no_dir = output_dir / 'no_outlier'
+                no_dir.mkdir(exist_ok=True)
+                no_pdf_dir = no_dir / 'pdf'
+                no_pdf_dir.mkdir(exist_ok=True)
+                thr = args.outlier_threshold
+
+                f_speedups, f_run1, f_run2, f_ids = filter_outliers(
+                    speedups, run1_ttfts_common, run2_ttfts_common,
+                    speedup_request_ids, threshold_multiplier=thr)
+
+                for dest in (no_dir, no_pdf_dir):
+                    ext = '.pdf' if dest == no_pdf_dir else '.png'
+                    create_ttft_comparison_scatter(
+                        f_run1, f_run2, f_ids,
+                        args.run1_label, args.run2_label,
+                        dest / f'ttft_comparison_scatter_no_outlier{ext}')
+                    create_speedup_histogram(
+                        f_speedups, args.run1_label, args.run2_label,
+                        dest / f'speedup_histogram_no_outlier{ext}')
+
+                    if run1_hit_ratios and len(run1_hit_ratios) > 0:
+                        f_aligned = [
+                            run1_hit_ratios[rid] if rid < len(run1_hit_ratios) else 0
+                            for rid in f_ids
+                        ]
+                        if len(f_aligned) == len(f_speedups):
+                            create_speedup_vs_hit_ratio_plot(
+                                f_speedups, f_aligned, f_ids,
+                                dest / f'speedup_vs_hit_ratio_no_outlier{ext}')
+                            create_speedup_vs_hit_ratio_log_plot(
+                                f_speedups, f_aligned, f_ids,
+                                dest / f'speedup_vs_hit_ratio_log_no_outlier{ext}')
+
+                    if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
+                        extra_map = dict(zip(extra_hit_request_ids, zip(extra_hit_speedups, extra_hit_ratios)))
+                        f_extra_s, f_extra_r, f_extra_ids = [], [], []
+                        for rid in f_ids:
+                            if rid in extra_map:
+                                s, r = extra_map[rid]
+                                f_extra_s.append(s)
+                                f_extra_r.append(r)
+                                f_extra_ids.append(rid)
+                        if f_extra_r:
+                            # Re-filter the extra arrays by the same speedup threshold
+                            f_extra_s2, f_extra_r2, f_extra_ids2 = filter_outliers(
+                                f_extra_s, f_extra_r, f_extra_ids,
+                                threshold_multiplier=thr)
+                            create_speedup_vs_extra_hit_ratio_plot(
+                                f_extra_s2, f_extra_r2, f_extra_ids2,
+                                args.run1_label, args.run2_label,
+                                dest / f'speedup_vs_extra_hit_ratio_no_outlier{ext}')
+
+                print(f"No-outlier plots saved to {no_dir}")
+                print(f"No-outlier PDF plots saved to {no_pdf_dir}")
+
             print(f"\nAll plots saved to {output_dir}")
             print(f"PDF plots saved to {pdf_dir}")
         else:
@@ -770,7 +888,7 @@ def main():
                 run1_ttfts_common, run2_ttfts_common, speedup_request_ids,
                 args.run1_label, args.run2_label)
             create_speedup_histogram(speedups, args.run1_label, args.run2_label)
-            
+
             if run1_hit_ratios and len(run1_hit_ratios) > 0:
                 aligned_hit_ratios = []
                 for req_id in speedup_request_ids:
@@ -778,16 +896,59 @@ def main():
                         aligned_hit_ratios.append(run1_hit_ratios[req_id])
                     else:
                         aligned_hit_ratios.append(0)
-                
+
                 if len(aligned_hit_ratios) == len(speedups):
                     create_speedup_vs_hit_ratio_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids)
-            
+                    create_speedup_vs_hit_ratio_log_plot(
+                        speedups, aligned_hit_ratios, speedup_request_ids)
+
             # Extra cache hit ratio interactive plot
             if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
                 create_speedup_vs_extra_hit_ratio_plot(
                     extra_hit_speedups, extra_hit_ratios, extra_hit_request_ids,
                     args.run1_label, args.run2_label)
+
+            # --- No-outlier versions (interactive) ---
+            if args.plot_no_outlier:
+                thr = args.outlier_threshold
+                f_speedups, f_run1, f_run2, f_ids = filter_outliers(
+                    speedups, run1_ttfts_common, run2_ttfts_common,
+                    speedup_request_ids, threshold_multiplier=thr)
+
+                create_ttft_comparison_scatter(
+                    f_run1, f_run2, f_ids,
+                    args.run1_label, args.run2_label)
+                create_speedup_histogram(
+                    f_speedups, args.run1_label, args.run2_label)
+
+                if run1_hit_ratios and len(run1_hit_ratios) > 0:
+                    f_aligned = [
+                        run1_hit_ratios[rid] if rid < len(run1_hit_ratios) else 0
+                        for rid in f_ids
+                    ]
+                    if len(f_aligned) == len(f_speedups):
+                        create_speedup_vs_hit_ratio_plot(
+                            f_speedups, f_aligned, f_ids)
+                        create_speedup_vs_hit_ratio_log_plot(
+                            f_speedups, f_aligned, f_ids)
+
+                if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
+                    extra_map = dict(zip(extra_hit_request_ids, zip(extra_hit_speedups, extra_hit_ratios)))
+                    f_extra_s, f_extra_r, f_extra_ids = [], [], []
+                    for rid in f_ids:
+                        if rid in extra_map:
+                            s, r = extra_map[rid]
+                            f_extra_s.append(s)
+                            f_extra_r.append(r)
+                            f_extra_ids.append(rid)
+                    if f_extra_r:
+                        f_extra_s2, f_extra_r2, f_extra_ids2 = filter_outliers(
+                            f_extra_s, f_extra_r, f_extra_ids,
+                            threshold_multiplier=thr)
+                        create_speedup_vs_extra_hit_ratio_plot(
+                            f_extra_s2, f_extra_r2, f_extra_ids2,
+                            args.run1_label, args.run2_label)
     
     # Save data to CSV
     csv_file = Path(args.output_dir) / 'lmcache_comparison_data.csv' if args.output_dir else Path('lmcache_comparison_data.csv')

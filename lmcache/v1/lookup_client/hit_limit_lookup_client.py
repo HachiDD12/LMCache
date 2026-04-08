@@ -40,7 +40,13 @@ class HitLimitLookupClient(LookupClientInterface):
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
         # get real hit tokens
-        result = self.actual_lookup_client.lookup(token_ids, lookup_id, request_configs)
+        raw = self.actual_lookup_client.lookup(token_ids, lookup_id, request_configs)
+        # Blend mode returns (max_hit_end, blend_hit_tokens) tuple
+        if isinstance(raw, tuple):
+            result, blend_hit_tokens = raw
+        else:
+            result = raw
+            blend_hit_tokens = None
         if result is not None:
             total_tokens_length = len(token_ids)
             assert result <= total_tokens_length
@@ -64,6 +70,8 @@ class HitLimitLookupClient(LookupClientInterface):
                     f"the origin result is {origin_result}, "
                     f"the new result is {new_result}, the final result is {result}"
                 )
+        if blend_hit_tokens is not None:
+            return (result, blend_hit_tokens)
         return result
 
     def supports_producer_reuse(self) -> bool:

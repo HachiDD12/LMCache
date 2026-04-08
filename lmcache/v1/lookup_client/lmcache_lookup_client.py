@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 import json
 import threading
 
@@ -101,7 +101,7 @@ class LMCacheLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
-    ) -> Optional[int]:
+    ) -> Optional[Union[int, Tuple[int, int]]]:
         lookup_id_buf = lookup_id.encode("utf-8")
         request_configs_str = ""
         if request_configs is not None and len(request_configs) != 0:
@@ -138,6 +138,7 @@ class LMCacheLookupClient(LookupClientInterface):
             ]
 
         results = []
+        blend_hit_results = []
         try:
             for i in range(ranks):
                 self.sockets[i].send_multipart(msg_buf, copy=False)
@@ -145,14 +146,20 @@ class LMCacheLookupClient(LookupClientInterface):
             # TODO(Jiayi): we can use zmq poll to optimize a bit
             for i in range(ranks):
                 resp = self.sockets[i].recv()
-                result = int.from_bytes(resp, "big")
-                results.append(result)
+                if self.enable_blending and len(resp) == 12:
+                    result = int.from_bytes(resp[:4], "big")
+                    blend_hit = int.from_bytes(resp[4:], "big")
+                    results.append(result)
+                    blend_hit_results.append(blend_hit)
+                else:
+                    result = int.from_bytes(resp, "big")
+                    results.append(result)
         except zmq.Again:
             logger.error(f"Timeout occurred for rank {i}")
-            return 0
+            return (0, 0) if self.enable_blending else 0
         except zmq.ZMQError as e:
             logger.error(f"ZMQ error for rank {i}: {str(e)}")
-            return 0
+            return (0, 0) if self.enable_blending else 0
 
         assert len(results) == ranks
         if len(set(results)) > 1:
@@ -163,6 +170,10 @@ class LMCacheLookupClient(LookupClientInterface):
         # NOTE: it is possible that the number of hit tokens is different
         # across TP ranks, so we can use the minimum value as the
         # number of hit tokens.
+        if blend_hit_results:
+            # Pick the rank with min max_hit_end and use its blend_hit_tokens
+            min_rank = results.index(min(results))
+            return (results[min_rank], blend_hit_results[min_rank])
         return min(results)
 
     def supports_producer_reuse(self) -> bool:
@@ -236,7 +247,12 @@ class LMCacheLookupServer:
                         pin=True,
                         request_configs=request_configs,
                     )
-                response = result.to_bytes(4, "big")
+                if self.enable_blending:
+                    blend_hit = self.lmcache_engine._last_blend_hit_tokens
+                    response = (result.to_bytes(4, "big")
+                                + blend_hit.to_bytes(8, "big"))
+                else:
+                    response = result.to_bytes(4, "big")
                 self.socket.send(response)
 
         logger.info(f"lmcache lookup server start on {socket_path}")

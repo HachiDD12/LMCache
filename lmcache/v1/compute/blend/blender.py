@@ -98,8 +98,28 @@ class LMCBlender:
             # TODO(Jiayi): remove `[0]` hardcode
             topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
 
-            top_indices = torch.topk(diff_k, k=topk_num).indices
-            top_indices, _ = torch.sort(top_indices)
+            gap_positions = self.gpu_connector.current_gap_positions
+            if gap_positions is not None and gap_positions.numel() > 0:
+                gap_set = set(gap_positions.tolist())
+                non_gap_mask = torch.tensor(
+                    [i not in gap_set for i in range(total_len)],
+                    dtype=torch.bool, device=diff_k.device,
+                )
+                extra_budget = max(0, topk_num - len(gap_positions))
+                if extra_budget > 0 and non_gap_mask.any():
+                    non_gap_diff = diff_k.clone()
+                    non_gap_diff[gap_positions] = -1.0
+                    extra_indices = torch.topk(
+                        non_gap_diff, k=min(extra_budget, non_gap_mask.sum().item())
+                    ).indices
+                    top_indices = torch.cat([gap_positions.to(diff_k.device), extra_indices])
+                else:
+                    top_indices = gap_positions.to(diff_k.device)
+                topk_num = len(top_indices)
+                top_indices, _ = torch.sort(top_indices)
+            else:
+                top_indices = torch.topk(diff_k, k=topk_num).indices
+                top_indices, _ = torch.sort(top_indices)
 
             k, v = k[top_indices], v[top_indices]
             q = q[top_indices]

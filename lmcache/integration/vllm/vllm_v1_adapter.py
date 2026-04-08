@@ -52,6 +52,7 @@ from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
 )
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
 from lmcache.v1.plugin.plugin_launcher import PluginLauncher
+from lmcache.v1.profiling import KVCacheProfiler
 
 if TYPE_CHECKING:
     # Third Party
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+_profiler = KVCacheProfiler.get()
 
 
 @dataclass
@@ -852,26 +854,28 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     )
                 else:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                    with _profiler.phase("adapter.start_load_kv.retrieve_layer_init"):
+                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            sync=sync,
+                        )
+                        # NOTE: retrieve for two layers at the first layer
+                        next(layerwise_retriever)
+                        next(layerwise_retriever)
+                    self.layerwise_retrievers.append(layerwise_retriever)
+            else:
+                with _profiler.phase("adapter.start_load_kv.retrieve"):
+                    ret_token_mask = self.lmcache_engine.retrieve(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        sync=sync,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
                     )
-                    # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
-            else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                )
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -903,13 +907,16 @@ class LMCacheConnectorV1Impl:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
         # Wait for the layer to be loaded
-        for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
+        with _profiler.phase(
+            f"adapter.wait_for_layer_load.L{self.current_layer}"
+        ):
+            for layerwise_retriever in self.layerwise_retrievers:
+                ret_token_mask = next(layerwise_retriever)
 
-            if self.current_layer == self.num_layers - 1:
-                assert ret_token_mask is not None
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+                if self.current_layer == self.num_layers - 1:
+                    assert ret_token_mask is not None
+                    num_retrieved_tokens = ret_token_mask.sum().item()
+                    logger.info(f"Retrieved {num_retrieved_tokens} tokens")
 
         return
 
@@ -1010,8 +1017,11 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-        for layerwise_storer in self.layerwise_storers:
-            next(layerwise_storer)
+        with _profiler.phase(
+            f"adapter.save_kv_layer.L{self.current_layer}"
+        ):
+            for layerwise_storer in self.layerwise_storers:
+                next(layerwise_storer)
 
         self.current_layer += 1
 
@@ -1029,8 +1039,9 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
-            for layerwise_storer in self.layerwise_storers:
-                next(layerwise_storer)
+            with _profiler.phase("adapter.wait_for_save.layerwise_finalize"):
+                for layerwise_storer in self.layerwise_storers:
+                    next(layerwise_storer)
             return
 
         assert len(self.kv_caches) > 0
@@ -1094,15 +1105,16 @@ class LMCacheConnectorV1Impl:
                 store_mask = store_mask[:aligned_token_len]
                 slot_mapping = slot_mapping[:aligned_token_len]
 
-            self.lmcache_engine.store(
-                token_ids,
-                mask=store_mask,
-                kvcaches=kvcaches,
-                slot_mapping=slot_mapping,
-                offset=skip_leading_tokens,
-                transfer_spec=request.disagg_spec,
-                request_configs=request.request_configs,
-            )
+            with _profiler.phase("adapter.wait_for_save.store"):
+                self.lmcache_engine.store(
+                    token_ids,
+                    mask=store_mask,
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping,
+                    offset=skip_leading_tokens,
+                    transfer_spec=request.disagg_spec,
+                    request_configs=request.request_configs,
+                )
 
             # NOTE(Jiayi): We assume all tokens are saved
             save_spec.skip_leading_tokens = len(token_ids)
@@ -1164,13 +1176,13 @@ class LMCacheConnectorV1Impl:
 
         self._lookup_requests_in_step.append(lookup_id)
 
-        num_external_hit_tokens = self.lookup_client.lookup(
+        lookup_result = self.lookup_client.lookup(
             token_ids,
             lookup_id=lookup_id,
             request_configs=request_configs,
         )
 
-        if num_external_hit_tokens is None:
+        if lookup_result is None:
             logger.info(
                 "Reqid: %s, Total tokens %d, LMCache hit tokens: None.",
                 request.request_id,
@@ -1178,27 +1190,34 @@ class LMCacheConnectorV1Impl:
             )
             return None
 
+        # Blend mode returns (max_hit_end, blend_hit_tokens) tuple
+        if isinstance(lookup_result, tuple):
+            max_hit_end, blend_hit_tokens = lookup_result
+        else:
+            max_hit_end = lookup_result
+            blend_hit_tokens = max_hit_end
+
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
         # a better support for this case.
-        need_to_allocate = num_external_hit_tokens - num_computed_tokens
+        need_to_allocate = max_hit_end - num_computed_tokens
 
         # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        if max_hit_end == request.num_tokens:
             need_to_allocate -= 1
 
         logger.info(
             "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
-            num_external_hit_tokens,
+            blend_hit_tokens,
             need_to_allocate,
         )
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
-            lmcache_cached_tokens=num_external_hit_tokens,
+            lmcache_cached_tokens=max_hit_end,
             can_load=False,
         )
 

@@ -153,6 +153,8 @@ class BlendServer:
         # Create FastAPI app
         self.app = FastAPI(title="LMCache Blend Server", version="1.0.0")
         self.setup_routes()
+        
+        self.showed_sample_completion = False
     
     def log_request(self, request: ChatCompletionRequest, response: ChatCompletionResponse, generation_time: float):
         """Log the request and response to the JSON file"""
@@ -360,8 +362,6 @@ class BlendServer:
             print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
             # Extract generated text
             
-            # print(f"@@@@@ Outputs: {outputs}")
-            # print(f"@@@@@ Outputs[0]: {outputs[0]}")
             
             choices = []
             for i, completion in enumerate(outputs[0].outputs):

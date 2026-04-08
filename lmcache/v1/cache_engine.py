@@ -45,6 +45,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
+from lmcache.v1.profiling import KVCacheProfiler
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
@@ -52,6 +53,7 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+_profiler = KVCacheProfiler.get()
 
 
 class CacheEngineEndSignal:
@@ -91,6 +93,8 @@ class LMCacheEngine:
         self.gpu_connector = gpu_connector
         self.broadcast_fn = broadcast_fn
         self.broadcast_object_fn = broadcast_object_fn
+        # Blend lookup side-channel: actual hit token count (vs max_hit_end)
+        self._last_blend_hit_tokens: int = 0
         # save_only_first_rank only works when use mla
         self.save_only_first_rank = (
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
@@ -227,6 +231,8 @@ class LMCacheEngine:
 
         monitor_req_id = self.stats_monitor.on_store_request(num_to_store_tokens)
 
+        _profiler.start_op("store", num_tokens=num_to_store_tokens)
+
         starts = []
         ends = []
         keys = []
@@ -242,49 +248,60 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
-        for start, end, key in self.token_database.process_tokens(
-            tokens,
-            hashes,
-            offsets,
-            mask,
-            request_configs=request_configs,
-        ):
-            assert isinstance(key, CacheEngineKey)
-            # Allocate the memory object
-            num_tokens = end - start
-            kv_shape = self.gpu_connector.get_shape(num_tokens)
+        with _profiler.phase("store.token_db_and_alloc", sync_cuda=False):
+            chunk_infos: List[Tuple[int, int, CacheEngineKey, torch.Size]] = []
             kv_dtype = self.metadata.kv_dtype
+            for start, end, key in self.token_database.process_tokens(
+                tokens,
+                hashes,
+                offsets,
+                mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                num_tokens = end - start
+                kv_shape = self.gpu_connector.get_shape(num_tokens)
+                chunk_infos.append((start, end, key, kv_shape))
 
-            # TODO (Jiayi): should be batched in the future
-            memory_obj = self.storage_manager.allocate(
-                kv_shape,
-                kv_dtype,
-                busy_loop=self.force_store_wait,
-            )
-            if memory_obj is None:
-                logger.warning(
-                    "Local cpu memory under pressure so"
-                    " choosing to not store the KV cache."
+            if chunk_infos:
+                shapes = [info[3] for info in chunk_infos]
+                alloc_results = self.storage_manager.batched_allocate_varied(
+                    shapes,
+                    kv_dtype,
+                    busy_loop=self.force_store_wait,
                 )
-                break
-
-            starts.append(start)
-            ends.append(end)
-            keys.append(key)
-            memory_objs.append(memory_obj)
-            tot_kv_size += memory_obj.get_size()
-            tot_token_num += num_tokens
+                if alloc_results is None:
+                    logger.warning(
+                        "Local cpu memory under pressure so"
+                        " choosing to not store the KV cache."
+                    )
+                else:
+                    for (start, end, key, _), memory_obj in zip(
+                        chunk_infos, alloc_results
+                    ):
+                        starts.append(start)
+                        ends.append(end)
+                        keys.append(key)
+                        memory_objs.append(memory_obj)
+                        tot_kv_size += memory_obj.get_size()
+                        tot_token_num += end - start
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
+            _profiler.end_op()
             return
-        self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+
+        with _profiler.phase("store.gpu_offload"):
+            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
 
         t = time.perf_counter()
 
-        transfer_spec = kwargs.get("transfer_spec", None)
-        self.storage_manager.batched_put(keys, memory_objs, transfer_spec=transfer_spec)
+        with _profiler.phase("store.storage_put", sync_cuda=False):
+            transfer_spec = kwargs.get("transfer_spec", None)
+            self.storage_manager.batched_put(
+                keys, memory_objs, transfer_spec=transfer_spec
+            )
         put_time += time.perf_counter() - t
 
         tot_time = offload_time + put_time
@@ -302,6 +319,7 @@ class LMCacheEngine:
         )
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        _profiler.end_op()
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -338,6 +356,8 @@ class LMCacheEngine:
             num_to_store_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_store_request(num_to_store_tokens)
 
+        _profiler.start_op("store_layer", num_tokens=num_to_store_tokens)
+
         starts = []
         ends = []
         keys = []
@@ -348,40 +368,41 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs
-        ):
-            assert isinstance(key, CacheEngineKey)
+        with _profiler.phase("store_layer.token_db_and_alloc", sync_cuda=False):
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens, mask=mask, request_configs=request_configs
+            ):
+                assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(keys_multi_layer[0]):
-                continue
+                keys_multi_layer = key.split_layers(self.num_layers)
+                # Only check the first layer
+                if self.storage_manager.contains(keys_multi_layer[0]):
+                    continue
 
-            # Allocate the memory object
-            num_tokens = end - start
-            kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+                # Allocate the memory object
+                num_tokens = end - start
+                kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
-            memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                kv_shape_single_layer,
-                kv_dtype,
-                batch_size=self.num_layers,
-                fmt=self.fmt,
-                busy_loop=self.force_store_wait,
-            )
-
-            if memory_objs_multi_layer is None:
-                logger.warning(
-                    "Local cpu memory under pressure so"
-                    " choosing to not store the KV cache."
+                memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    batch_size=self.num_layers,
+                    fmt=self.fmt,
+                    busy_loop=self.force_store_wait,
                 )
-                break
 
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
-            memory_objs.append(memory_objs_multi_layer)
-            tot_token_num += num_tokens
+                if memory_objs_multi_layer is None:
+                    logger.warning(
+                        "Local cpu memory under pressure so"
+                        " choosing to not store the KV cache."
+                    )
+                    break
+
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
+                memory_objs.append(memory_objs_multi_layer)
+                tot_token_num += num_tokens
 
         if keys:
             # Transpose the keys and memory objects into layer major format
@@ -405,8 +426,16 @@ class LMCacheEngine:
 
             for layer_id in range(self.num_layers):
                 yield
-                next(mem_obj_generator)
-                self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
+                with _profiler.phase(
+                    f"store_layer.gpu_offload_L{layer_id}"
+                ):
+                    next(mem_obj_generator)
+                with _profiler.phase(
+                    f"store_layer.storage_put_L{layer_id}", sync_cuda=False
+                ):
+                    self.storage_manager.batched_put(
+                        keys[layer_id], memory_objs[layer_id]
+                    )
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -415,6 +444,7 @@ class LMCacheEngine:
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         logger.debug(f"Stored {tot_token_num} out of total {len(tokens)} tokens")
+        _profiler.end_op()
         yield
 
     @_lmcache_nvtx_annotate
@@ -455,24 +485,27 @@ class LMCacheEngine:
             num_required_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
+        _profiler.start_op("retrieve", num_tokens=num_required_tokens)
+
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[Tuple[CacheEngineKey, MemoryObj, int, int]] = []
         if not self._is_passive():
-            if self.async_loading:
-                reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
-                    tokens,
-                    mask,
-                    ret_mask,
-                    **kwargs,
-                )
-            else:
-                reordered_chunks, tot_kv_size = self._process_tokens_internal(
-                    tokens,
-                    mask,
-                    ret_mask,
-                    **kwargs,
-                )
+            with _profiler.phase("retrieve.storage_get"):
+                if self.async_loading:
+                    reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
+                        tokens,
+                        mask,
+                        ret_mask,
+                        **kwargs,
+                    )
+                else:
+                    reordered_chunks, tot_kv_size = self._process_tokens_internal(
+                        tokens,
+                        mask,
+                        ret_mask,
+                        **kwargs,
+                    )
         if self.save_only_first_rank:
             with torch.cuda.stream(self.broadcast_stream):
                 self._broadcast_or_receive_memory_objs(
@@ -495,9 +528,10 @@ class LMCacheEngine:
         # RDMA is another example.
         if len(reordered_chunks) > 0:
             _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
-            self.gpu_connector.batched_to_gpu(
-                list(memory_objs), list(starts), list(ends), **kwargs
-            )
+            with _profiler.phase("retrieve.gpu_onload"):
+                self.gpu_connector.batched_to_gpu(
+                    list(memory_objs), list(starts), list(ends), **kwargs
+                )
 
         # TODO(Jiayi): Remove the following for loop with batched operations
         # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
@@ -521,6 +555,7 @@ class LMCacheEngine:
             onload_time * 1000,
             tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
         )
+        _profiler.end_op()
         return ret_mask
 
     @_lmcache_nvtx_annotate
@@ -560,6 +595,8 @@ class LMCacheEngine:
             num_required_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
+        _profiler.start_op("retrieve_layer", num_tokens=num_required_tokens)
+
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         starts = []
@@ -569,30 +606,61 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
-        ):
-            assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+        is_blend = isinstance(self.token_database, SegmentTokenDatabase)
 
-            # NOTE: Only check the first layer
-            if not self.storage_manager.contains(keys_multi_layer[0]):
-                break
+        # Which backend actually holds the chunk (CPU hot vs disk, etc.). Must match
+        # layerwise_batched_get(..., location=...) — see _process_tokens_internal.
+        chunk_location: Optional[str] = None
 
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
+        with _profiler.phase("retrieve_layer.token_db", sync_cuda=False):
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
 
-            ret_mask[start:end] = True
+                keys_multi_layer = key.split_layers(self.num_layers)
+
+                # NOTE: Only check the first layer. Pin so entries are not evicted
+                # before batched_get runs (async gap after this loop).
+                location = self.storage_manager.contains(
+                    keys_multi_layer[0], pin=True
+                )
+                if not location:
+                    if is_blend:
+                        continue
+                    break
+
+                if chunk_location is None:
+                    chunk_location = location
+                elif location != chunk_location:
+                    logger.warning(
+                        "retrieve_layer: chunks map to different storage backends "
+                        "(%s vs %s); stopping prefix at this chunk. "
+                        "Layerwise retrieve requires a single tier per batch.",
+                        chunk_location,
+                        location,
+                    )
+                    break
+
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
+
+                ret_mask[start:end] = True
+
+        mem_obj_consumer = None
 
         if keys:
+            assert chunk_location is not None
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
+            get_generator = self.storage_manager.layerwise_batched_get(
+                keys_layer_major, location=chunk_location
+            )
 
             assert isinstance(
                 self.gpu_connector,
@@ -602,12 +670,17 @@ class LMCacheEngine:
                     SGLangLayerwiseGPUConnector,
                 ),
             )
+            if is_blend:
+                kwargs["full_num_tokens"] = len(tokens)
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
             next(mem_obj_consumer)
 
             to_count_down = []
             for layer_id in range(self.num_layers):
-                task = next(get_generator)
+                with _profiler.phase(
+                    f"retrieve_layer.storage_get_L{layer_id}", sync_cuda=False
+                ):
+                    task = next(get_generator)
 
                 assert task is not None
 
@@ -618,8 +691,11 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
-                mem_obj_consumer.send(mem_objs_layer)
+                with _profiler.phase(
+                    f"retrieve_layer.gpu_onload_L{layer_id}"
+                ):
+                    mem_objs_layer = task.result()
+                    mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
@@ -633,7 +709,8 @@ class LMCacheEngine:
         yield None
 
         # synchronize the last layer
-        next(mem_obj_consumer)
+        if mem_obj_consumer is not None:
+            next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -643,6 +720,7 @@ class LMCacheEngine:
             f"out of total {len(tokens)} tokens"
         )
 
+        _profiler.end_op()
         yield ret_mask
 
     @_lmcache_nvtx_annotate
@@ -689,9 +767,15 @@ class LMCacheEngine:
             assert hashes is not None
             self.stats_monitor.on_lookup_request(sum(offsets))
 
+        is_blend = isinstance(self.token_database, SegmentTokenDatabase)
+
         try:
             end = 0
             prev_end = 0
+            max_hit_end = 0
+            total_chunks = 0
+            hit_chunks = 0
+            blend_hit_tokens = 0
 
             if pin:
                 assert lookup_id is not None, "lookup_id is required when pin is True"
@@ -703,6 +787,7 @@ class LMCacheEngine:
                 request_configs=request_configs,
             ):
                 assert isinstance(key, CacheEngineKey)
+                total_chunks += 1
 
                 if self.use_layerwise:
                     # TODO(Jiayi): Optimize by checking only the existence of the key
@@ -716,30 +801,50 @@ class LMCacheEngine:
                         ):
                             found = True
                     if found:
+                        hit_chunks += 1
+                        blend_hit_tokens += end - start
                         if pin:
                             self.lookup_pins[lookup_id].extend(  # type: ignore
                                 key_all_layers
                             )
                         prev_end = end
+                        max_hit_end = end
+                        continue
+                    if is_blend:
                         continue
                     end = prev_end
                     return prev_end
                 else:
                     if self.storage_manager.contains(key, search_range, pin):
+                        hit_chunks += 1
+                        blend_hit_tokens += end - start
                         if pin:
                             self.lookup_pins[lookup_id].append(  # type: ignore
                                 key
                             )
                         prev_end = end
+                        max_hit_end = end
                         continue
 
+                    if is_blend:
+                        continue
                     end = prev_end
                     return prev_end
 
-            # all tokens where found, return the maximal end
+            # all tokens were found, return the maximal end
+            if is_blend:
+                logger.info(
+                    "Blend lookup: %d/%d chunks hit, "
+                    "blend_hit_tokens=%d, max_hit_end=%d",
+                    hit_chunks, total_chunks,
+                    blend_hit_tokens, max_hit_end,
+                )
+                self._last_blend_hit_tokens = blend_hit_tokens
+                return max_hit_end
             return end
         finally:
-            self.stats_monitor.on_lookup_finished(end)
+            report_end = max_hit_end if is_blend else end
+            self.stats_monitor.on_lookup_finished(report_end)
             # vllm lookup sets pin to True
             if pin:
                 self.storage_manager.touch_cache()
@@ -1030,6 +1135,9 @@ class LMCacheEngine:
             self.lmcache_worker.close()
 
         self.storage_manager.close()
+
+        if _profiler.enabled:
+            logger.info(_profiler.summary())
 
         logger.info("LMCacheEngine closed.")
 

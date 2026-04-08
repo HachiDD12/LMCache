@@ -274,6 +274,23 @@ class StorageManager:
         )
 
     @_lmcache_nvtx_annotate
+    def batched_allocate_varied(
+        self,
+        shapes: list[torch.Size],
+        dtype: torch.dtype,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction=True,
+        busy_loop=True,
+    ) -> Optional[list[MemoryObj]]:
+        """
+        Allocate memory objects with varied shapes in one pass.
+        Uses bulk eviction to avoid per-chunk retry loops.
+        """
+        return self.allocator_backend.batched_allocate_varied(
+            shapes, dtype, fmt, eviction=eviction, busy_loop=busy_loop
+        )
+
+    @_lmcache_nvtx_annotate
     def batched_allocate(
         self,
         shape: torch.Size,

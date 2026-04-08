@@ -118,7 +118,7 @@ class LocalDiskBackend(StorageBackendInterface):
         assert config.local_disk is not None
         self.path: str = config.local_disk
         if not os.path.exists(self.path):
-            os.makedirs(self.path)
+            os.makedirs(self.path, exist_ok=True)
             logger.info(f"Created local disk cache directory: {self.path}")
 
         self.loop = loop
@@ -397,9 +397,14 @@ class LocalDiskBackend(StorageBackendInterface):
                 fmt,
             )
 
-            assert memory_obj is not None, (
-                "Memory allocation failed during async disk load."
-            )
+            if memory_obj is None:
+                logger.warning(
+                    "Memory allocation failed during async disk load "
+                    f"for key {key}. CPU memory under pressure, "
+                    "skipping remaining prefetch keys."
+                )
+                self.disk_lock.release()
+                break
 
             self.dict[key].pin()
 

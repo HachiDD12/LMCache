@@ -2,7 +2,7 @@
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 import os
 import queue
 import threading
@@ -81,8 +81,9 @@ class LMCLocalBackend(LMCBackendInterface):
         elif self.device == "cuda":
             self.mpool = LocalGPUPool(metadata)
 
-        # TODO(Jiayi): A gpu buffer could speed up `get`
-        # self.fix_sized_dst_buffer = torch.tensor()
+        self._put_stream = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
+        )
 
     def contains(
         self,
@@ -114,6 +115,32 @@ class LMCLocalBackend(LMCBackendInterface):
         self.mpool.free(kv_obj)
 
     @_lmcache_nvtx_annotate
+    def _batched_copy(
+        self, items: List[Tuple[KVObj, torch.Tensor]]
+    ) -> None:
+        """Copy kv data into allocated pool objects using a shared CUDA stream."""
+        if not items:
+            return
+
+        if self._put_stream is not None:
+            first_chunk = items[0][1]
+            if first_chunk.is_cuda:
+                self._put_stream.wait_stream(
+                    torch.cuda.default_stream(first_chunk.device)
+                )
+
+            with torch.cuda.stream(self._put_stream):
+                for kv_obj, kv_chunk in items:
+                    kv_obj.data.copy_(kv_chunk, non_blocking=True)
+                    if kv_chunk.is_cuda:
+                        kv_chunk.record_stream(self._put_stream)
+
+            self._put_stream.synchronize()
+        else:
+            for kv_obj, kv_chunk in items:
+                kv_obj.data.copy_(kv_chunk, non_blocking=False)
+
+    @_lmcache_nvtx_annotate
     def put_worker(
         self,
     ):
@@ -121,13 +148,15 @@ class LMCLocalBackend(LMCBackendInterface):
             item = self.put_queue.get()
             if isinstance(item, LocalBackendEndSignal):
                 break
-            key, value = item
-            self.put_nonblocking(key, value)
+            if isinstance(item, list):
+                self._batched_put_nonblocking(item)
+            else:
+                key, value = item
+                self.put_nonblocking(key, value)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def put_nonblocking(self, key, kv_chunk):
-        # Obtain keys to evict
         self.update_lock.acquire()
         evict_keys, put_status = self.evictor.update_on_put(
             self.dict, self.mpool.size_per_chunk
@@ -136,53 +165,107 @@ class LMCLocalBackend(LMCBackendInterface):
             self.update_lock.release()
             return
 
-        # evict caches
         for evict_key in evict_keys:
             self.remove(evict_key)
 
-        # free old block to avoid mem leak
         if key in self.dict:
             self.remove(key)
 
-        # Allocate the kv chunk
         kv_obj = self.mpool.allocate(kv_chunk)
         self.update_lock.release()
 
         if kv_obj is None:
             return
 
-        put_stream = torch.cuda.Stream()
-        if kv_chunk.device != torch.cpu:
-            # wait operation in main stream to finish
-            # e.g., view operations on kv_chunk
-            put_stream.wait_stream(torch.cuda.default_stream(kv_chunk.device))
+        self._batched_copy([(kv_obj, kv_chunk)])
 
-        with torch.cuda.stream(put_stream):
-            kv_obj.data.copy_(kv_chunk, non_blocking=True)
-            kv_chunk.record_stream(put_stream)
-        put_stream.synchronize()
-
-        # Store new chunk
         self.update_lock.acquire()
         self.dict[key] = kv_obj
         self.update_lock.release()
 
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def _batched_put_nonblocking(
+        self, items: List[Tuple[CacheEngineKey, torch.Tensor]]
+    ) -> None:
+        """Store multiple chunks with batched locking and a single stream sync."""
+        allocations: List[Tuple[CacheEngineKey, KVObj, torch.Tensor]] = []
+
+        self.update_lock.acquire()
+        for key, kv_chunk in items:
+            evict_keys, put_status = self.evictor.update_on_put(
+                self.dict, self.mpool.size_per_chunk
+            )
+            if put_status == PutStatus.ILLEGAL:
+                continue
+
+            for evict_key in evict_keys:
+                self.remove(evict_key)
+
+            if key in self.dict:
+                self.remove(key)
+
+            kv_obj = self.mpool.allocate(kv_chunk)
+            if kv_obj is not None:
+                allocations.append((key, kv_obj, kv_chunk))
+        self.update_lock.release()
+
+        if not allocations:
+            return
+
+        self._batched_copy([(obj, chunk) for _, obj, chunk in allocations])
+
+        self.update_lock.acquire()
+        for key, kv_obj, _ in allocations:
+            self.dict[key] = kv_obj
+        self.update_lock.release()
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def _batched_put_blocking(
+        self, items: List[Tuple[CacheEngineKey, torch.Tensor]]
+    ) -> int:
+        """Store multiple chunks with batched locking and a single copy pass."""
+        allocations: List[Tuple[CacheEngineKey, KVObj, torch.Tensor]] = []
+
+        with self.update_lock:
+            for key, kv_chunk in items:
+                evict_keys, put_status = self.evictor.update_on_put(
+                    self.dict, self.mpool.size_per_chunk
+                )
+                if put_status == PutStatus.ILLEGAL:
+                    continue
+
+                for evict_key in evict_keys:
+                    self.remove(evict_key)
+
+                if key in self.dict:
+                    self.remove(key)
+
+                kv_obj = self.mpool.allocate(kv_chunk)
+                if kv_obj is not None:
+                    allocations.append((key, kv_obj, kv_chunk))
+
+        self._batched_copy([(obj, chunk) for _, obj, chunk in allocations])
+
+        with self.update_lock:
+            for key, kv_obj, _ in allocations:
+                self.dict[key] = kv_obj
+
+        return len(allocations)
+
     @torch.inference_mode()
     def put_blocking(self, key, kv_chunk):
-        # Obtain keys to evict
         evict_keys, put_status = self.evictor.update_on_put(
             self.dict, self.mpool.size_per_chunk
         )
 
-        # Abort put if cache too big
         if put_status == PutStatus.ILLEGAL:
             return
 
-        # free old block to avoid mem leak
         if key in self.dict:
             self.remove(key)
 
-        # Evict caches
         for evict_key in evict_keys:
             self.remove(evict_key)
 
@@ -193,7 +276,6 @@ class LMCLocalBackend(LMCBackendInterface):
 
         kv_obj.data.copy_(kv_chunk, non_blocking=False)
 
-        # Store new chunk
         self.dict[key] = kv_obj
 
     def put(
@@ -220,6 +302,24 @@ class LMCLocalBackend(LMCBackendInterface):
             self.put_blocking(key, kv_chunk)
         else:
             self.put_queue.put((key, kv_chunk))
+
+    def batched_put(
+        self,
+        keys_and_chunks: Iterable[Tuple[CacheEngineKey, torch.Tensor]],
+        blocking: bool = True,
+    ) -> int:
+        """
+        Store multiple KV cache chunks with batched locking and stream reuse.
+        """
+        items = list(keys_and_chunks)
+        if not items:
+            return 0
+
+        if blocking:
+            return self._batched_put_blocking(items)
+        else:
+            self.put_queue.put(items)
+            return len(items)
 
     @_lmcache_nvtx_annotate
     def get(

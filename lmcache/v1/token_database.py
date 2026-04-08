@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from array import array
 from typing import Any, Iterable, List, Optional, Tuple, Union
 import abc
 import traceback
@@ -132,17 +133,16 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         prefix_hash: Optional[int] = None,
         extra_keys: Optional[list[Any]] = None,
     ) -> int:
+        # BREAKING CHANGE: Uses raw bytes instead of tuple-of-ints for speed.
+        # Existing caches created with the old hash will not match.
         if isinstance(tokens, torch.Tensor):
-            tokens_tuple = tuple(tokens.cpu().tolist())
+            tokens_bytes = tokens.cpu().numpy().tobytes()
         elif isinstance(tokens, list):
-            tokens_tuple = tuple(tokens)
+            tokens_bytes = array("q", tokens).tobytes()
         else:
             raise ValueError(f"Unsupported tokens type: {type(tokens)}")
 
-        # Ignore extra keys for now
-        # Extra keys are for multi-modal inputs and
-        # request specific metadata (e.g., LoRA ID).
-        return self.hash_func((prefix_hash, tokens_tuple, extra_keys))
+        return self.hash_func((prefix_hash, tokens_bytes, extra_keys))
 
 
 class ChunkedTokenDatabase(TokenDatabase):
@@ -369,16 +369,19 @@ class SegmentTokenDatabase(TokenDatabase):
         :param Optional[List[int]] offsets: The number of tokens in each chunk.
 
         :param Optional[torch.Tensor] mask: The mask for the tokens. Should
-            have the same length as tokens. And the mask should ALWAYS be like
-            FFFFFTTTTTTT, where True means the tokens needs to be matched,
-            and the Falses will ALWAYS be at the PREFIX of the tensor.
+            have the same length as tokens. Falses at the PREFIX indicate
+            tokens already cached by the serving engine (e.g. vLLM prefix
+            cache) and will be skipped during lookup. The mask format is
+            FFFFFTTTTTTT. Note: for blend (segment) mode, chunks after the
+            False prefix are hashed independently, so non-contiguous cache
+            hits among those chunks are supported by the cache engine.
 
         :param bool make_key: Whether to make the cache engine key or not.
             If False, the hash value will be returned instead.
 
         :param Optional[dict] request_configs: The configs of the request.
 
-        :returns: A iterable of tuples with three elements. The first element
+        :returns: An iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
             is the end index of the tokens for the key. The third element is
             the cache engine key for the tokens.
@@ -405,7 +408,12 @@ class SegmentTokenDatabase(TokenDatabase):
                 traceback.print_stack()
                 raise ValueError(f"The number of Falses in the mask is greater than the length of tokens. num_falses: {num_falses}, len(tokens): {len(tokens)}")
 
-            token_chunks = self._fast_split_by_subtensor(tokens)
+            token_chunks = list(self._fast_split_by_subtensor(tokens))
+            logger.info(
+                "SegmentTokenDB.process_tokens: num_tokens=%d, sep_tokens=%s, num_chunks=%d, chunk_lens=%s",
+                len(tokens), self.sep_tokens.tolist(), len(token_chunks),
+                [len(c) for c in token_chunks]
+            )
             start_idx = 0
             for idx, token_chunk in enumerate(token_chunks):
                 token_chunk_len = len(token_chunk)
@@ -413,17 +421,23 @@ class SegmentTokenDatabase(TokenDatabase):
                 if idx > 0:
                     start_idx += self.sep_len
                     end_idx += self.sep_len
+                chunk_hash = self._hash_tokens(token_chunk)
+                logger.info(
+                    "  chunk %d: start=%d, end=%d, len=%d, hash=%d, first5=%s",
+                    idx, start_idx, end_idx, token_chunk_len, chunk_hash,
+                    token_chunk[:5].tolist() if isinstance(token_chunk, torch.Tensor) else token_chunk[:5]
+                )
                 if start_idx >= num_falses:
                     if make_key:
                         yield (
                             start_idx,
                             end_idx,
                             self._make_key_by_hash(
-                                self._hash_tokens(token_chunk), request_configs
+                                chunk_hash, request_configs
                             ),
                         )
                     else:
-                        yield start_idx, end_idx, self._hash_tokens(token_chunk)
+                        yield start_idx, end_idx, chunk_hash
                 start_idx = end_idx
         elif hashes is not None:
             assert offsets is not None, (

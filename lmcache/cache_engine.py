@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Dict, Iterable, List, Optional, Tuple, Union
+import hashlib
 import logging
 import time
 
@@ -73,7 +74,13 @@ class LMCacheEngine:
         tokens: torch.Tensor,
         prefix_hash: int,
     ) -> int:
-        return hash((prefix_hash, tuple(tokens.tolist())))
+        token_bytes = tokens.numpy().tobytes()
+        combined = prefix_hash.to_bytes(8, byteorder="little", signed=True) + token_bytes
+        return int.from_bytes(
+            hashlib.blake2b(combined, digest_size=8).digest(),
+            byteorder="little",
+            signed=True,
+        )
 
     def _chunk_tokens(
         self,
@@ -88,8 +95,12 @@ class LMCacheEngine:
         :return: a generator of chunks of tokens, each with
                 shape [chunk_size]
         """
-        # TODO(Jiayi): the following step can be parallelized
-        tokens = tokens.cpu()
+        if tokens.device.type != "cpu":
+            tokens_cpu = torch.empty(
+                tokens.shape, dtype=tokens.dtype, pin_memory=True
+            )
+            tokens_cpu.copy_(tokens)
+            tokens = tokens_cpu
         for i in range(0, len(tokens), self.chunk_size):
             yield tokens[i : i + self.chunk_size]
 
@@ -110,21 +121,24 @@ class LMCacheEngine:
         kv_tensors: KVCache,
     ) -> torch.Tensor:
         """Convert the nested tuple of kv tensors to a single
-        big tensor with 2 extra dimensions
+        big tensor with 2 extra dimensions.
+
+        Output shape: [num_layer, 2, num_tok, num_kv_head, head_size]
         """
-        k_temp = []
-        v_temp = []
-        for kv_layer in kv_tensors:
-            k_temp.append(kv_layer[0])
-            v_temp.append(kv_layer[1])
-        k_tensor_blob = torch.stack(k_temp)
-        v_tensor_blob = torch.stack(v_temp)
+        num_layers = len(kv_tensors)
+        sample = kv_tensors[0][0]
+        # shape = (num_layers, 2, num_tok, num_kv_head, head_size)
+        output = torch.empty(
+            (num_layers, 2) + sample.shape,
+            dtype=sample.dtype,
+            device=sample.device,
+        )
 
-        # kv_tensors: [num_layer, 2, num_tok, num_kv_head, head_size]
-        kv_tensors_flatten = torch.stack((k_tensor_blob, v_tensor_blob))
-        kv_tensors_flatten = kv_tensors_flatten.permute([1, 0, 2, 3, 4])
+        for i, (k, v) in enumerate(kv_tensors):
+            output[i, 0] = k
+            output[i, 1] = v
 
-        return kv_tensors_flatten
+        return output
 
     def _blob_to_tuple_kv(
         self,
@@ -150,26 +164,18 @@ class LMCacheEngine:
         """
         match fmt:
             case "vllm":
+                sliced = kv_tensors[:, :, start_idx:, ...]
+                num_tokens = sliced.shape[2]
                 return [
-                    x.contiguous()
-                    for x in list(
-                        torch.split(
-                            kv_tensors[:, :, start_idx:, ...],
-                            self.chunk_size,
-                            dim=2,
-                        )
-                    )
+                    sliced[:, :, i : i + self.chunk_size, ...].clone()
+                    for i in range(0, num_tokens, self.chunk_size)
                 ]
             case "huggingface":
+                sliced = kv_tensors[:, :, :, start_idx:, ...]
+                num_tokens = sliced.shape[3]
                 return [
-                    x.contiguous()
-                    for x in list(
-                        torch.split(
-                            kv_tensors[:, :, :, start_idx:, ...],
-                            self.chunk_size,
-                            dim=3,
-                        )
-                    )
+                    sliced[:, :, :, i : i + self.chunk_size, ...].clone()
+                    for i in range(0, num_tokens, self.chunk_size)
                 ]
             case _:
                 raise ValueError(f"Invalid format: {fmt}")
