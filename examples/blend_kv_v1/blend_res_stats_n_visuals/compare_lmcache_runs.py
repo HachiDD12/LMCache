@@ -30,6 +30,39 @@ def set_plot_fonts():
         'figure.titlesize': 28
     })
 
+
+# vLLM's chunked-prefill scheduler dispatches the same logical request to
+# LMCache once per prefill step, prepending the step index to the request_id
+# (e.g. "0_<hash>", "1_<hash>", ... in the new content-hash format, or
+# "0_342", "1_342", ... in the legacy str(rid) format). Only one of the
+# step variants is the unprefixed form, so to group every prefill step of
+# the same logical request under one key we strip the leading "<digit>+_"
+# prefix at parse time. The suffix is constrained to a known request-id
+# shape (hash with optional twin tag, or bare integer) so we don't
+# accidentally over-normalize unrelated identifiers.
+_CHUNKED_PREFILL_PREFIX_RE = re.compile(
+    r'^(\d+)_(\d+|[0-9a-f]{16}(?:#\d+)?)$'
+)
+
+
+def normalize_req_id(req_id):
+    """Strip a chunked-prefill step prefix from ``req_id`` if present.
+
+    Handles both ID flavours observed in real logs:
+      - new content-hash form  ``<step>_<16-hex>[#N]``  -> ``<16-hex>[#N]``
+      - legacy integer form    ``<step>_<int>``         -> ``<int>``
+
+    Non-prefixed IDs pass through unchanged so logs that already use the
+    bare form (and the orphan-record bucket) are unaffected.
+    """
+    if not req_id:
+        return req_id
+    m = _CHUNKED_PREFILL_PREFIX_RE.match(req_id)
+    if m:
+        return m.group(2)
+    return req_id
+
+
 def extract_cache_data(err_file_path):
     """
     Extract request ID, total tokens, and LMCache hit tokens from the error log file.
@@ -47,24 +80,36 @@ def extract_cache_data(err_file_path):
     """
     cache_data_by_id = {}
     cache_data_by_pos = {}
+    seen_norm_ids = set()
 
     pattern = r'Reqid: ([^,]+), Total tokens (\d+), LMCache hit tokens: (\d+), need to load: \d+'
     pat = re.compile(pattern)
 
-    request_counter = 0
+    logical_counter = 0
+    normalized_count = 0
 
     try:
         with open(err_file_path, 'r') as f:
             for line in f:
                 match = pat.search(line)
                 if match:
-                    req_id_str = match.group(1).strip()
+                    raw_id = match.group(1).strip()
+                    req_id_str = normalize_req_id(raw_id)
+                    if req_id_str != raw_id:
+                        normalized_count += 1
                     total_tokens = int(match.group(2))
                     hit_tokens = int(match.group(3))
                     record = (total_tokens, hit_tokens)
+
+                    # First observation wins: subsequent chunked-prefill steps
+                    # for the same logical request report stale or partial
+                    # cache state, so the initial lookup is the meaningful one.
+                    if req_id_str in seen_norm_ids:
+                        continue
+                    seen_norm_ids.add(req_id_str)
                     cache_data_by_id[req_id_str] = record
-                    cache_data_by_pos[request_counter] = record
-                    request_counter += 1
+                    cache_data_by_pos[logical_counter] = record
+                    logical_counter += 1
     except FileNotFoundError:
         print(f"Warning: Could not find file {err_file_path}")
         return {}, {}
@@ -73,8 +118,12 @@ def extract_cache_data(err_file_path):
         return {}, {}
 
     if cache_data_by_pos:
-        print(f"Extracted cache data for {len(cache_data_by_pos)} requests from {err_file_path}"
-              f" ({len(cache_data_by_id)} unique req_ids)")
+        msg = (f"Extracted cache data for {len(cache_data_by_pos)} logical requests"
+               f" from {err_file_path}"
+               f" ({len(cache_data_by_id)} unique req_ids)")
+        if normalized_count:
+            msg += f"; collapsed {normalized_count} chunked-prefill step lines"
+        print(msg)
     return cache_data_by_id, cache_data_by_pos
 
 
@@ -161,7 +210,12 @@ def extract_ttft_data(out_file_path):
                     req_id_str = (match[2] or "").strip() or None
                     ttft = float(match[3])
                     if req_id_str:
-                        ttft_data_by_id[req_id_str] = ttft
+                        # Server only ever emits the bare form here, but
+                        # normalize defensively in case future log shapes
+                        # ever carry a chunked-prefill prefix.
+                        req_id_str = normalize_req_id(req_id_str)
+                        if req_id_str not in ttft_data_by_id:
+                            ttft_data_by_id[req_id_str] = ttft
                     ttft_data_by_pos[request_counter] = ttft
                     request_counter += 1
             else:
@@ -171,7 +225,9 @@ def extract_ttft_data(out_file_path):
                     ttft = float(match[0])
                     req_id_str = (match[1] or "").strip() or None
                     if req_id_str:
-                        ttft_data_by_id[req_id_str] = ttft
+                        req_id_str = normalize_req_id(req_id_str)
+                        if req_id_str not in ttft_data_by_id:
+                            ttft_data_by_id[req_id_str] = ttft
                     ttft_data_by_pos[request_counter] = ttft
                     request_counter += 1
 
@@ -557,30 +613,6 @@ def filter_outliers(speedups, *arrays, threshold_multiplier=1.5):
     print(f"  Removed {removed} outlier(s) for no-outlier plots "
           f"(threshold: {threshold_multiplier}x IQR)")
     return filtered
-
-
-# vLLM's chunked-prefill scheduler dispatches the same logical request to
-# LMCache once per prefill step, prepending the step index to the request_id
-# (e.g. "0_<hash>", "1_<hash>", ...). The bare-hash form -- which is what the
-# server's [MAPPING] line and the .err Reqid: line use -- only ever shows up
-# for the first step. To group every prefill step of the same logical request
-# under one key, we strip the leading "<digit>+_" prefix at load time.
-_CHUNKED_PREFILL_PREFIX_RE = re.compile(r'^(\d+)_([0-9a-f]{16}(?:#\d+)?)$')
-
-
-def normalize_req_id(req_id):
-    """Strip a chunked-prefill step prefix from ``req_id`` if present.
-
-    Returns the bare 16-hex content hash (with any twin-disambiguation
-    ``#N`` suffix preserved). Non-prefixed IDs pass through unchanged so
-    legacy logs and the orphan-record bucket are unaffected.
-    """
-    if not req_id:
-        return req_id
-    m = _CHUNKED_PREFILL_PREFIX_RE.match(req_id)
-    if m:
-        return m.group(2)
-    return req_id
 
 
 def load_profile_records(profile_file):

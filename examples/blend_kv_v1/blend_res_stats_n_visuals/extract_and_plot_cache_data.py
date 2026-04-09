@@ -34,6 +34,27 @@ def set_plot_fonts():
         'figure.titlesize': 28
     })
 
+
+# vLLM's chunked-prefill scheduler dispatches the same logical request to
+# LMCache once per prefill step, prepending the step index to request_id
+# (e.g. "0_<hash>", "1_<hash>", ... or in legacy logs "0_342", "1_342", ...).
+# Strip the leading "<digit>+_" prefix at parse time so all steps of one
+# logical request collapse to a single key. Suffix is constrained to a known
+# request-id shape so unrelated identifiers don't get over-normalized.
+_CHUNKED_PREFILL_PREFIX_RE = re.compile(
+    r'^(\d+)_(\d+|[0-9a-f]{16}(?:#\d+)?)$'
+)
+
+
+def normalize_req_id(req_id):
+    if not req_id:
+        return req_id
+    m = _CHUNKED_PREFILL_PREFIX_RE.match(req_id)
+    if m:
+        return m.group(2)
+    return req_id
+
+
 def extract_cache_data(err_file_path):
     """
     Extract request ID, total tokens, and LMCache hit tokens from the error log file.
@@ -54,25 +75,35 @@ def extract_cache_data(err_file_path):
     """
     cache_data_by_id = {}
     cache_data_by_pos = {}
+    seen_norm_ids = set()
 
     pattern = r'Reqid: ([^,]+), Total tokens (\d+), LMCache hit tokens: (\d+), need to load: \d+'
     pat = re.compile(pattern)
 
-    request_counter = 0
+    logical_counter = 0
+    normalized_count = 0
 
     try:
         with open(err_file_path, 'r') as f:
             for line in f:
                 match = pat.search(line)
                 if match:
-                    req_id_str = match.group(1).strip()
+                    raw_id = match.group(1).strip()
+                    req_id_str = normalize_req_id(raw_id)
+                    if req_id_str != raw_id:
+                        normalized_count += 1
                     total_tokens = int(match.group(2))
                     hit_tokens = int(match.group(3))
                     record = (total_tokens, hit_tokens)
 
+                    # First observation per logical request wins so positional
+                    # alignment counts logical requests, not log lines.
+                    if req_id_str in seen_norm_ids:
+                        continue
+                    seen_norm_ids.add(req_id_str)
                     cache_data_by_id[req_id_str] = record
-                    cache_data_by_pos[request_counter] = record
-                    request_counter += 1
+                    cache_data_by_pos[logical_counter] = record
+                    logical_counter += 1
     except FileNotFoundError:
         print(f"Error: Could not find file {err_file_path}")
         return {}, {}
@@ -80,8 +111,11 @@ def extract_cache_data(err_file_path):
         print(f"Error reading {err_file_path}: {e}")
         return {}, {}
 
-    print(f"Extracted cache data for {len(cache_data_by_pos)} requests from {err_file_path}"
-          f" ({len(cache_data_by_id)} unique req_ids)")
+    msg = (f"Extracted cache data for {len(cache_data_by_pos)} logical requests from "
+           f"{err_file_path} ({len(cache_data_by_id)} unique req_ids)")
+    if normalized_count:
+        msg += f"; collapsed {normalized_count} chunked-prefill step lines"
+    print(msg)
     return cache_data_by_id, cache_data_by_pos
 
 def extract_speedup_data(out_file_path):
@@ -134,7 +168,9 @@ def extract_speedup_data(out_file_path):
                     speedup = float(match[4])
                     record = (ttft, speedup)
                     if req_id_str:
-                        speedup_data_by_id[req_id_str] = record
+                        req_id_str = normalize_req_id(req_id_str)
+                        if req_id_str not in speedup_data_by_id:
+                            speedup_data_by_id[req_id_str] = record
                     speedup_data_by_pos[request_counter] = record
                     request_counter += 1
             else:
@@ -145,7 +181,9 @@ def extract_speedup_data(out_file_path):
                     req_id_str = (match[1] or "").strip() or None
                     record = (ttft, 1.0)
                     if req_id_str:
-                        speedup_data_by_id[req_id_str] = record
+                        req_id_str = normalize_req_id(req_id_str)
+                        if req_id_str not in speedup_data_by_id:
+                            speedup_data_by_id[req_id_str] = record
                     speedup_data_by_pos[request_counter] = record
                     request_counter += 1
 
