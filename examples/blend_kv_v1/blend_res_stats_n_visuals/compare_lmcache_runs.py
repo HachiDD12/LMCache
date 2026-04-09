@@ -559,13 +559,40 @@ def filter_outliers(speedups, *arrays, threshold_multiplier=1.5):
     return filtered
 
 
+# vLLM's chunked-prefill scheduler dispatches the same logical request to
+# LMCache once per prefill step, prepending the step index to the request_id
+# (e.g. "0_<hash>", "1_<hash>", ...). The bare-hash form -- which is what the
+# server's [MAPPING] line and the .err Reqid: line use -- only ever shows up
+# for the first step. To group every prefill step of the same logical request
+# under one key, we strip the leading "<digit>+_" prefix at load time.
+_CHUNKED_PREFILL_PREFIX_RE = re.compile(r'^(\d+)_([0-9a-f]{16}(?:#\d+)?)$')
+
+
+def normalize_req_id(req_id):
+    """Strip a chunked-prefill step prefix from ``req_id`` if present.
+
+    Returns the bare 16-hex content hash (with any twin-disambiguation
+    ``#N`` suffix preserved). Non-prefixed IDs pass through unchanged so
+    legacy logs and the orphan-record bucket are unaffected.
+    """
+    if not req_id:
+        return req_id
+    m = _CHUNKED_PREFILL_PREFIX_RE.match(req_id)
+    if m:
+        return m.group(2)
+    return req_id
+
+
 def load_profile_records(profile_file):
     """Load an LMCache profiler JSONL file into ``{req_id: [records]}``.
 
     Each record is a dict of the form emitted by ``lmcache/v1/profiling.py``:
     ``{"op": ..., "req_id": ..., "phases": {...}, "wall_ts": ..., ...}``.
-    Records without a ``req_id`` field (orphaned phases, legacy logs) are
-    collected under the ``None`` key so callers can still count them.
+    Records carrying a chunked-prefill step prefix are normalized to their
+    bare content hash so all steps of one logical request land under the
+    same key. Records without a ``req_id`` field (orphaned phases, legacy
+    logs) are collected under the ``None`` key so callers can still count
+    them.
     """
     by_req_id = defaultdict(list)
     if profile_file is None:
@@ -574,6 +601,7 @@ def load_profile_records(profile_file):
     if not path.exists():
         print(f"  Warning: profile file not found: {path}")
         return by_req_id
+    normalized_count = 0
     try:
         with open(path) as f:
             for line in f:
@@ -584,9 +612,21 @@ def load_profile_records(profile_file):
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                by_req_id[rec.get("req_id")].append(rec)
+                raw = rec.get("req_id")
+                norm = normalize_req_id(raw)
+                if raw and norm != raw:
+                    # Preserve the original step-prefixed form so per-step
+                    # ordering / debugging is still possible from the record.
+                    rec["chunked_prefill_step_id"] = raw
+                    normalized_count += 1
+                by_req_id[norm].append(rec)
     except Exception as e:
         print(f"  Warning: failed to read profile file {path}: {e}")
+    if normalized_count:
+        print(
+            f"  Normalized {normalized_count} chunked-prefill step records "
+            f"({path.name})"
+        )
     return by_req_id
 
 

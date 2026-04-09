@@ -20,9 +20,25 @@ Dependencies:  only stdlib + matplotlib (optional for plots).
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+# vLLM's chunked-prefill scheduler dispatches the same logical request to
+# LMCache once per prefill step, prepending the step index to the request_id
+# (e.g. "0_<hash>", "1_<hash>", ...). Strip the prefix so all steps of one
+# logical request aggregate under a single key in the per-request table.
+_CHUNKED_PREFILL_PREFIX_RE = re.compile(r'^(\d+)_([0-9a-f]{16}(?:#\d+)?)$')
+
+
+def normalize_req_id(req_id):
+    if not req_id:
+        return req_id
+    m = _CHUNKED_PREFILL_PREFIX_RE.match(req_id)
+    if m:
+        return m.group(2)
+    return req_id
 
 
 def load_records(path: str) -> list[dict]:
@@ -101,15 +117,23 @@ def print_req_id_table(records: list[dict], top_n: int = 20) -> None:
     through vLLM and LMCache, so profile records carry it as a top-level
     field. This aggregates total phase time per request and prints the top
     ``top_n`` slowest requests — the landing zone for outlier drill-down.
+
+    Records bearing a vLLM chunked-prefill step prefix (e.g. ``0_<hash>``)
+    are normalized to their bare hash so every prefill step of one logical
+    request lands in the same row.
     """
     per_req: dict[str, float] = defaultdict(float)
     per_req_n: dict[str, int] = defaultdict(int)
     per_req_ops: dict[str, set] = defaultdict(set)
 
+    normalized = 0
     for rec in records:
-        req_id = rec.get("req_id")
-        if not req_id:
+        raw = rec.get("req_id")
+        if not raw:
             continue
+        req_id = normalize_req_id(raw)
+        if req_id != raw:
+            normalized += 1
         total = sum(rec.get("phases", {}).values())
         per_req[req_id] += total
         per_req_n[req_id] += 1
@@ -135,6 +159,11 @@ def print_req_id_table(records: list[dict], top_n: int = 20) -> None:
         print(f"  {req_id:<36} {per_req_n[req_id]:>8} {ops_str:<32} {total:>12.2f}")
     print("=" * 96)
     print(f"  Total unique req_ids seen: {len(per_req)}")
+    if normalized:
+        print(
+            f"  ({normalized} chunked-prefill step records were collapsed "
+            f"into their bare hash)"
+        )
 
 
 def plot_stacked_bar(records: list[dict], out_path: str) -> None:
