@@ -1,0 +1,50 @@
+================================================================================
+EXTREMELY GOOD SPEEDUP OUTLIERS
+================================================================================
+
+Total outliers detected: 4
+Outlier criterion: speedup > 5.0x (hard cutoff)
+Speedup calculation: E2E No Blend TTFT / E2E Chunked Blend 128 TTFT
+
+--------------------------------------------------------------------------------
+
+Request ID: 418639a390647602
+  E2E Chunked Blend 128 TTFT: 0.152600 seconds
+  E2E No Blend TTFT: 1.409800 seconds
+  Speedup: 9.2385x
+  Speedup percentage: 823.85% improvement
+  Cache Hit Ratio: 0.992453
+  Total Tokens: 795
+  Hit Tokens: 789
+--------------------------------------------------------------------------------
+
+Request ID: 8ac45e2a85824042
+  E2E Chunked Blend 128 TTFT: 2.013100 seconds
+  E2E No Blend TTFT: 20.717600 seconds
+  Speedup: 10.2914x
+  Speedup percentage: 929.14% improvement
+  Cache Hit Ratio: 0.001953
+  Total Tokens: 119793
+  Hit Tokens: 234
+--------------------------------------------------------------------------------
+
+Request ID: 9c20305dfe9bb8b3
+  E2E Chunked Blend 128 TTFT: 0.437700 seconds
+  E2E No Blend TTFT: 12.864600 seconds
+  Speedup: 29.3914x
+  Speedup percentage: 2839.14% improvement
+  Cache Hit Ratio: 0.001649
+  Total Tokens: 81246
+  Hit Tokens: 134
+--------------------------------------------------------------------------------
+
+Request ID: f9095c80843d7aa2
+  E2E Chunked Blend 128 TTFT: 1.349000 seconds
+  E2E No Blend TTFT: 10.912100 seconds
+  Speedup: 8.0890x
+  Speedup percentage: 708.90% improvement
+  Cache Hit Ratio: 0.001899
+  Total Tokens: 70579
+  Hit Tokens: 134
+--------------------------------------------------------------------------------
+

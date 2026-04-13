@@ -557,19 +557,152 @@ def create_speedup_histogram(speedups, run1_label="Run 1", run2_label="Run 2 (Ba
         plt.show()
     plt.close()
 
-def detect_outliers(speedups, threshold_multiplier=1.5, include_under=False):
-    """
-    Detect speedup outliers using the IQR method.
 
-    When ``include_under`` is False (default for legacy callers) only the
-    high tail — extremely good speedup — is returned. When True, the low
-    tail (Q1 - k*IQR) is also returned, tagged so callers can separate
-    over-performers from under-performers.
+def create_3d_speedup_plot(speedups, hit_ratios, total_tokens, request_ids,
+                           run1_label="Run 1", run2_label="Run 2 (Baseline)",
+                           output_file=None):
+    """3D scatter of speedup vs cache hit ratio vs total prompt tokens.
+
+    Mirrors the 3D plot in extract_and_plot_cache_data.py but only does
+    plane fitting (least-squares ``z = a*x + b*y + c``). Useful for seeing
+    whether the speedup surface is dominated by hit ratio, prompt length,
+    or some interaction between the two -- and where blend stops being
+    worthwhile (the floor / ceiling regions of the surface).
+    """
+    set_plot_fonts()
+    fig = plt.figure(figsize=(15, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    if not speedups or not hit_ratios or not total_tokens:
+        plt.close(fig)
+        print("3D speedup plot: empty input arrays; skipping")
+        return
+    if not (len(speedups) == len(hit_ratios) == len(total_tokens)):
+        plt.close(fig)
+        print(
+            f"3D speedup plot: length mismatch "
+            f"(speedups={len(speedups)}, hit_ratios={len(hit_ratios)}, "
+            f"total_tokens={len(total_tokens)}); skipping"
+        )
+        return
+
+    speedups_arr = np.asarray(speedups, dtype=float)
+    hit_arr = np.asarray(hit_ratios, dtype=float)
+    tok_arr = np.asarray(total_tokens, dtype=float)
+
+    # Drop points with missing total_tokens (== 0 means we had no err-side
+    # entry for that req); plotting them at y=0 would smear the fit.
+    mask = tok_arr > 0
+    if mask.sum() < len(tok_arr):
+        dropped = int((~mask).sum())
+        print(f"3D speedup plot: dropped {dropped} point(s) with no total_tokens")
+    speedups_arr = speedups_arr[mask]
+    hit_arr = hit_arr[mask]
+    tok_arr = tok_arr[mask]
+
+    if len(speedups_arr) == 0:
+        plt.close(fig)
+        print("3D speedup plot: nothing to plot after filtering; skipping")
+        return
+
+    # Scatter coloured by speedup
+    scatter = ax.scatter(
+        hit_arr, tok_arr, speedups_arr,
+        c=speedups_arr, cmap='viridis', alpha=0.7, s=50,
+    )
+    cbar = plt.colorbar(scatter, ax=ax, shrink=0.5, aspect=20)
+    cbar.set_label(f'Speedup ({run2_label} / {run1_label})', fontsize=18)
+
+    ax.set_xlabel('Cache Hit Ratio', fontsize=22, labelpad=20)
+    ax.set_ylabel('Total Tokens', fontsize=22, labelpad=20)
+    ax.set_zlabel(f'Speedup ({run2_label} / {run1_label})', fontsize=22, labelpad=20)
+    ax.set_title(
+        '3D: Speedup vs Hit Ratio vs Total Tokens',
+        fontsize=24, fontweight='bold',
+    )
+
+    z_max = float(speedups_arr.max()) * 1.1 + 0.5
+    ax.set_xlim(0, max(float(hit_arr.max()), 0.0) + 0.05)
+    ax.set_ylim(0, float(tok_arr.max()) * 1.05 if tok_arr.max() > 0 else 1)
+    ax.set_zlim(0, z_max)
+
+    # Plane fit: speedup = a*hit_ratio + b*total_tokens + c (least squares)
+    if len(speedups_arr) >= 3:
+        try:
+            A = np.column_stack([hit_arr, tok_arr, np.ones_like(hit_arr)])
+            coef, *_ = np.linalg.lstsq(A, speedups_arr, rcond=None)
+            a, b, c = float(coef[0]), float(coef[1]), float(coef[2])
+
+            # Surface grid
+            xs = np.linspace(0, float(hit_arr.max()), 30)
+            ys = np.linspace(0, float(tok_arr.max()), 30)
+            X, Y = np.meshgrid(xs, ys)
+            Z = a * X + b * Y + c
+            Z = np.clip(Z, 0, z_max)
+            ax.plot_surface(
+                X, Y, Z,
+                alpha=0.3, color='green', linewidth=0, antialiased=True,
+            )
+
+            # R^2 of the fit
+            z_pred = a * hit_arr + b * tok_arr + c
+            ss_res = float(np.sum((speedups_arr - z_pred) ** 2))
+            ss_tot = float(np.sum((speedups_arr - speedups_arr.mean()) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
+
+            print(
+                f"  3D plane fit: speedup = {a:.4g} * hit_ratio + "
+                f"{b:.4g} * total_tokens + {c:.4g}   "
+                f"(R^2 = {r2:.3f}, n = {len(speedups_arr)})"
+            )
+        except Exception as e:
+            print(f"  3D plane fit failed: {e}")
+
+    ax.tick_params(axis='y', labelrotation=15)
+    ax.view_init(elev=20, azim=45)
+    plt.tight_layout()
+
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"3D speedup plot saved to {output_file}")
+    else:
+        plt.show()
+    plt.close()
+
+
+def _format_outlier_criterion(threshold_multiplier, upper_cutoff):
+    """Return a human-readable description of the active over-performer rule.
+
+    Used by report headers and the filter print line so the criterion in
+    use is always visible (and changes label cleanly when the user passes
+    a hard ``--speedup-cutoff``).
+    """
+    if upper_cutoff is not None:
+        return f"speedup > {upper_cutoff}x (hard cutoff)"
+    return f"Q3 + {threshold_multiplier}*IQR"
+
+
+def detect_outliers(speedups, threshold_multiplier=1.5, include_under=False,
+                    upper_cutoff=None):
+    """
+    Detect speedup outliers.
+
+    Over-performer detection uses one of two strategies:
+      - hard cutoff: any speedup > ``upper_cutoff`` is an over-performer
+        (taken when ``upper_cutoff`` is not None; the IQR multiplier is
+        ignored for the upper tail)
+      - IQR: any speedup > Q3 + ``threshold_multiplier`` * IQR
+    Under-performer detection (only when ``include_under`` is True) always
+    uses Q1 - ``threshold_multiplier`` * IQR; the cutoff is upper-tail only
+    because that is the only side the user cares about today.
 
     Args:
-        speedups (list): List of speedup values
-        threshold_multiplier (float): Multiplier for IQR threshold (default: 1.5)
+        speedups (list): List of speedup values.
+        threshold_multiplier (float): IQR multiplier (default: 1.5). Ignored
+            for the upper tail when ``upper_cutoff`` is provided.
         include_under (bool): Also detect under-performers.
+        upper_cutoff (float | None): Hard speedup cutoff for over-performers.
+            Has highest priority when given.
 
     Returns:
         If ``include_under`` is False: list of indices (upper-tail only).
@@ -579,30 +712,43 @@ def detect_outliers(speedups, threshold_multiplier=1.5, include_under=False):
         return [] if not include_under else []
 
     speedups_array = np.array(speedups)
-    q1 = np.percentile(speedups_array, 25)
-    q3 = np.percentile(speedups_array, 75)
-    iqr = q3 - q1
 
-    upper_bound = q3 + threshold_multiplier * iqr
-    lower_bound = q1 - threshold_multiplier * iqr
-
-    upper_idx = np.where(speedups_array > upper_bound)[0].tolist()
+    if upper_cutoff is not None:
+        upper_idx = np.where(speedups_array > upper_cutoff)[0].tolist()
+    else:
+        q3 = np.percentile(speedups_array, 75)
+        iqr = q3 - np.percentile(speedups_array, 25)
+        upper_bound = q3 + threshold_multiplier * iqr
+        upper_idx = np.where(speedups_array > upper_bound)[0].tolist()
 
     if not include_under:
         return upper_idx
 
+    # Lower-tail detection always uses IQR (the cutoff knob is upper-only).
+    q1 = np.percentile(speedups_array, 25)
+    q3 = np.percentile(speedups_array, 75)
+    iqr = q3 - q1
+    lower_bound = q1 - threshold_multiplier * iqr
     lower_idx = np.where(speedups_array < lower_bound)[0].tolist()
+
     # Sorted by index so the two classes interleave in natural request order.
     tagged = [(i, "over") for i in upper_idx] + [(i, "under") for i in lower_idx]
     tagged.sort(key=lambda t: t[0])
     return tagged
 
-def filter_outliers(speedups, *arrays, threshold_multiplier=1.5):
+
+def filter_outliers(speedups, *arrays, threshold_multiplier=1.5,
+                    upper_cutoff=None):
     """
-    Remove outlier entries (by speedup IQR) from speedups and any
-    parallel arrays.  Returns the filtered versions in the same order.
+    Remove outlier entries from speedups and any parallel arrays.
+
+    When ``upper_cutoff`` is provided it overrides the IQR multiplier and
+    any speedup above the cutoff is treated as an outlier. Otherwise the
+    IQR rule from :func:`detect_outliers` applies. Returns the filtered
+    versions of all input arrays in the same order.
     """
-    outlier_set = set(detect_outliers(speedups, threshold_multiplier))
+    outlier_set = set(detect_outliers(
+        speedups, threshold_multiplier, upper_cutoff=upper_cutoff))
     if not outlier_set:
         return (speedups, *arrays)
     filtered = tuple(
@@ -610,8 +756,9 @@ def filter_outliers(speedups, *arrays, threshold_multiplier=1.5):
         for a in (speedups, *arrays)
     )
     removed = len(outlier_set)
+    criterion = _format_outlier_criterion(threshold_multiplier, upper_cutoff)
     print(f"  Removed {removed} outlier(s) for no-outlier plots "
-          f"(threshold: {threshold_multiplier}x IQR)")
+          f"(criterion: {criterion})")
     return filtered
 
 
@@ -743,6 +890,7 @@ def write_outlier_profile_report(
     run2_label,
     output_dir,
     iqr_threshold,
+    upper_cutoff=None,
 ):
     """Write a per-outlier profiler breakdown keyed by stable req_id.
 
@@ -751,6 +899,10 @@ def write_outlier_profile_report(
     summary followed by the op/phase breakdown from the supplied profile
     JSONL files. Phases whose average is >=1.5x the run-wide median get a
     ``<<< HOT`` marker so bottlenecks in outliers are immediately visible.
+
+    ``upper_cutoff`` (when given) replaces the IQR rule for over-performer
+    detection -- recorded in the report header so the criterion in use is
+    visible alongside the request list.
     """
     if not tagged_outliers:
         return
@@ -771,13 +923,16 @@ def write_outlier_profile_report(
 
     over_count = sum(1 for _, cls in tagged_outliers if cls == "over")
     under_count = sum(1 for _, cls in tagged_outliers if cls == "under")
+    over_criterion = _format_outlier_criterion(iqr_threshold, upper_cutoff)
+    under_criterion = f"Q1 - {iqr_threshold}*IQR"
 
     with open(out_file, "w") as f:
         f.write("=" * 100 + "\n")
         f.write("SPEEDUP OUTLIER PROFILE REPORT\n")
         f.write("=" * 100 + "\n\n")
         f.write(f"Speedup definition: {run2_label} TTFT / {run1_label} TTFT\n")
-        f.write(f"IQR threshold multiplier: {iqr_threshold}\n")
+        f.write(f"Over-performer criterion:  {over_criterion}\n")
+        f.write(f"Under-performer criterion: {under_criterion}\n")
         f.write(f"Over-performers (upper tail): {over_count}\n")
         f.write(f"Under-performers (lower tail): {under_count}\n\n")
         f.write(
@@ -866,10 +1021,11 @@ def write_outlier_profile_report(
 
 def write_outlier_details(outlier_indices, request_ids, run1_ttfts, run2_ttfts,
                          speedups, hit_ratios, total_tokens, hit_tokens,
-                         run1_label, run2_label, output_dir):
+                         run1_label, run2_label, output_dir,
+                         threshold_multiplier=1.5, upper_cutoff=None):
     """
     Write details of outlier data points to a file.
-    
+
     Args:
         outlier_indices (list): Indices of outlier speedup values
         request_ids (list): List of request IDs
@@ -882,22 +1038,28 @@ def write_outlier_details(outlier_indices, request_ids, run1_ttfts, run2_ttfts,
         run1_label (str): Label for run1
         run2_label (str): Label for run2
         output_dir (Path): Output directory path
+        threshold_multiplier (float): IQR multiplier used by the outlier
+            detector; recorded in the report header so it stays in sync
+            with the value actually applied (default: 1.5).
+        upper_cutoff (float | None): Hard speedup cutoff for over-performers.
+            When provided, takes precedence over the IQR multiplier.
     """
     if not outlier_indices:
         return
-    
+
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
     outlier_file = output_dir / 'speedup_outliers.txt'
-    
+
     has_cache_data = hit_ratios and len(hit_ratios) > 0
-    
+    criterion = _format_outlier_criterion(threshold_multiplier, upper_cutoff)
+
     with open(outlier_file, 'w') as f:
         f.write("=" * 80 + "\n")
         f.write("EXTREMELY GOOD SPEEDUP OUTLIERS\n")
         f.write("=" * 80 + "\n\n")
         f.write(f"Total outliers detected: {len(outlier_indices)}\n")
-        f.write(f"Outlier threshold: Values above Q3 + 1.5*IQR\n")
+        f.write(f"Outlier criterion: {criterion}\n")
         f.write(f"Speedup calculation: {run2_label} TTFT / {run1_label} TTFT\n\n")
         f.write("-" * 80 + "\n\n")
         
@@ -944,11 +1106,36 @@ def main():
                        help='Directory to save all plots (optional)')
     parser.add_argument('--no-plot', action='store_true',
                        help='Skip plotting and only show data summary')
-    parser.add_argument('--plot-no-outlier', action='store_true',
+    # ``--plot-no-outlier`` doubles as both an enable flag and a knob: pass
+    # it bare to use the default IQR multiplier from --outlier-threshold, or
+    # pass a float (e.g. ``--plot-no-outlier 2.5``) to override just the
+    # filter cutoff for the no-outlier plots without changing the value used
+    # by the textual outlier reports.
+    _NO_OUTLIER_DEFAULT_SENTINEL = -1.0
+    parser.add_argument('--plot-no-outlier', nargs='?', type=float,
+                       const=_NO_OUTLIER_DEFAULT_SENTINEL, default=None,
+                       metavar='IQR_MULT',
                        help='Also plot no-outlier versions of all plots '
-                            '(outliers removed using IQR method on speedup)')
+                            '(outliers removed using IQR method on speedup). '
+                            'Bare flag inherits --outlier-threshold; pass a '
+                            'float (e.g. --plot-no-outlier 2.5) to override '
+                            'just the no-outlier-plot IQR multiplier.')
     parser.add_argument('--outlier-threshold', type=float, default=1.5,
-                       help='IQR multiplier for outlier detection (default: 1.5)')
+                       help='IQR multiplier for outlier detection in the '
+                            'textual reports (default: 1.5). Also used as '
+                            'the no-outlier-plot threshold when '
+                            '--plot-no-outlier is given without a value.')
+    parser.add_argument('--speedup-cutoff', type=float, default=None,
+                       metavar='X',
+                       help='Hard speedup cutoff for over-performer outliers '
+                            '(e.g. --speedup-cutoff 5.0 marks any request '
+                            'with speedup > 5.0x as an over-performer). When '
+                            'provided, this takes precedence over BOTH '
+                            '--outlier-threshold and any value passed to '
+                            '--plot-no-outlier -- the IQR multiplier is '
+                            'ignored for the upper tail. Under-performer '
+                            'detection still uses --outlier-threshold. '
+                            'Implicitly enables the no-outlier plots.')
     parser.add_argument('--run1-profile-file', default=None,
                        help='Path to run1 LMCache profiler JSONL '
                             '(enables per-outlier phase breakdown)')
@@ -957,7 +1144,42 @@ def main():
                             '(enables per-outlier phase breakdown)')
 
     args = parser.parse_args()
-    
+
+    # Resolve over-performer outlier criterion. ``--speedup-cutoff`` has the
+    # highest priority and overrides any IQR multiplier from
+    # ``--plot-no-outlier`` or ``--outlier-threshold``.
+    #
+    # --plot-no-outlier resolution:
+    #   absent          -> disabled (unless --speedup-cutoff was given)
+    #   bare            -> enabled with --outlier-threshold as the IQR cutoff
+    #   <float>         -> enabled with the given float as the IQR cutoff
+    if args.plot_no_outlier is None:
+        plot_no_outlier_enabled = False
+        no_outlier_threshold = None
+    else:
+        plot_no_outlier_enabled = True
+        if args.plot_no_outlier == _NO_OUTLIER_DEFAULT_SENTINEL:
+            no_outlier_threshold = args.outlier_threshold
+        else:
+            no_outlier_threshold = args.plot_no_outlier
+
+    # ``--speedup-cutoff`` implicitly enables the no-outlier plots so callers
+    # don't have to also pass ``--plot-no-outlier``.
+    if args.speedup_cutoff is not None:
+        plot_no_outlier_enabled = True
+
+    if plot_no_outlier_enabled:
+        if args.speedup_cutoff is not None:
+            print(
+                f"No-outlier plots: enabled (hard cutoff = "
+                f"speedup > {args.speedup_cutoff}x; IQR ignored)"
+            )
+        else:
+            print(
+                f"No-outlier plots: enabled (IQR multiplier = "
+                f"{no_outlier_threshold})"
+            )
+
     # Expand user paths
     run1_err_file = Path(args.run1_err_file).expanduser() if args.run1_err_file else None
     run1_out_file = Path(args.run1_out_file).expanduser()
@@ -1019,7 +1241,11 @@ def main():
 
     def _aligned_hit_ratios(ids):
         return [run1_hit_ratio_map.get(rid, 0) for rid in ids]
-    
+
+    def _aligned_total_tokens(ids):
+        return [run1_total_tokens_map.get(rid, 0) for rid in ids]
+
+
     # Print summary statistics
     print("\nData Summary:")
     print("-" * 20)
@@ -1110,9 +1336,12 @@ def main():
     # report walks BOTH tails (over- and under-performers) and joins them
     # against the LMCache profiler JSONL files so each outlier gets a
     # phase-level breakdown rather than just speedup/TTFT numbers.
-    outlier_indices = detect_outliers(speedups, args.outlier_threshold)
+    outlier_indices = detect_outliers(
+        speedups, args.outlier_threshold, upper_cutoff=args.speedup_cutoff,
+    )
     tagged_outliers = detect_outliers(
-        speedups, args.outlier_threshold, include_under=True
+        speedups, args.outlier_threshold,
+        include_under=True, upper_cutoff=args.speedup_cutoff,
     )
 
     if tagged_outliers and args.output_dir:
@@ -1127,7 +1356,9 @@ def main():
             write_outlier_details(
                 outlier_indices, speedup_request_ids, run1_ttfts_common, run2_ttfts_common,
                 speedups, aligned_hit_ratios, aligned_total_tokens, aligned_hit_tokens,
-                args.run1_label, args.run2_label, args.output_dir)
+                args.run1_label, args.run2_label, args.output_dir,
+                threshold_multiplier=args.outlier_threshold,
+                upper_cutoff=args.speedup_cutoff)
 
         # New two-tailed profiler-aware report
         run1_records_by_id = load_profile_records(args.run1_profile_file)
@@ -1151,6 +1382,7 @@ def main():
             run2_label=args.run2_label,
             output_dir=args.output_dir,
             iqr_threshold=args.outlier_threshold,
+            upper_cutoff=args.speedup_cutoff,
         )
     elif tagged_outliers:
         over = sum(1 for _, c in tagged_outliers if c == "over")
@@ -1181,6 +1413,7 @@ def main():
             # Cache-related plots (only if cache data exists)
             if run1_hit_ratios and len(run1_hit_ratios) > 0:
                 aligned_hit_ratios = _aligned_hit_ratios(speedup_request_ids)
+                aligned_total_tokens_plot = _aligned_total_tokens(speedup_request_ids)
 
                 if len(aligned_hit_ratios) == len(speedups):
                     create_speedup_vs_hit_ratio_plot(
@@ -1189,6 +1422,11 @@ def main():
                     create_speedup_vs_hit_ratio_log_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids,
                         output_dir / 'speedup_vs_hit_ratio_log.png')
+                    create_3d_speedup_plot(
+                        speedups, aligned_hit_ratios, aligned_total_tokens_plot,
+                        speedup_request_ids,
+                        args.run1_label, args.run2_label,
+                        output_dir / 'speedup_3d.png')
 
             # Extra cache hit ratio plot (blend vs prefix cache)
             if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
@@ -1208,6 +1446,7 @@ def main():
             
             if run1_hit_ratios and len(run1_hit_ratios) > 0:
                 aligned_hit_ratios = _aligned_hit_ratios(speedup_request_ids)
+                aligned_total_tokens_plot = _aligned_total_tokens(speedup_request_ids)
 
                 if len(aligned_hit_ratios) == len(speedups):
                     create_speedup_vs_hit_ratio_plot(
@@ -1216,6 +1455,11 @@ def main():
                     create_speedup_vs_hit_ratio_log_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids,
                         pdf_dir / 'speedup_vs_hit_ratio_log.pdf')
+                    create_3d_speedup_plot(
+                        speedups, aligned_hit_ratios, aligned_total_tokens_plot,
+                        speedup_request_ids,
+                        args.run1_label, args.run2_label,
+                        pdf_dir / 'speedup_3d.pdf')
 
             # Extra cache hit ratio PDF plot
             if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
@@ -1225,16 +1469,23 @@ def main():
                     pdf_dir / 'speedup_vs_extra_hit_ratio.pdf')
             
             # --- No-outlier versions ---
-            if args.plot_no_outlier:
+            if plot_no_outlier_enabled:
                 no_dir = output_dir / 'no_outlier'
                 no_dir.mkdir(exist_ok=True)
                 no_pdf_dir = no_dir / 'pdf'
                 no_pdf_dir.mkdir(exist_ok=True)
-                thr = args.outlier_threshold
+                # When --speedup-cutoff is given the IQR multiplier is unused
+                # by detect_outliers, but filter_outliers still requires a
+                # numeric value for its formatter -- fall back to the
+                # textual-report threshold so the placeholder is sensible.
+                thr = no_outlier_threshold if no_outlier_threshold is not None else args.outlier_threshold
+                cutoff = args.speedup_cutoff
 
                 f_speedups, f_run1, f_run2, f_ids = filter_outliers(
                     speedups, run1_ttfts_common, run2_ttfts_common,
-                    speedup_request_ids, threshold_multiplier=thr)
+                    speedup_request_ids,
+                    threshold_multiplier=thr,
+                    upper_cutoff=cutoff)
 
                 for dest in (no_dir, no_pdf_dir):
                     ext = '.pdf' if dest == no_pdf_dir else '.png'
@@ -1248,6 +1499,7 @@ def main():
 
                     if run1_hit_ratios and len(run1_hit_ratios) > 0:
                         f_aligned = _aligned_hit_ratios(f_ids)
+                        f_aligned_tokens = _aligned_total_tokens(f_ids)
                         if len(f_aligned) == len(f_speedups):
                             create_speedup_vs_hit_ratio_plot(
                                 f_speedups, f_aligned, f_ids,
@@ -1255,6 +1507,10 @@ def main():
                             create_speedup_vs_hit_ratio_log_plot(
                                 f_speedups, f_aligned, f_ids,
                                 dest / f'speedup_vs_hit_ratio_log_no_outlier{ext}')
+                            create_3d_speedup_plot(
+                                f_speedups, f_aligned, f_aligned_tokens, f_ids,
+                                args.run1_label, args.run2_label,
+                                dest / f'speedup_3d_no_outlier{ext}')
 
                     if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
                         extra_map = dict(zip(extra_hit_request_ids, zip(extra_hit_speedups, extra_hit_ratios)))
@@ -1266,10 +1522,11 @@ def main():
                                 f_extra_r.append(r)
                                 f_extra_ids.append(rid)
                         if f_extra_r:
-                            # Re-filter the extra arrays by the same speedup threshold
+                            # Re-filter the extra arrays by the same speedup criterion
                             f_extra_s2, f_extra_r2, f_extra_ids2 = filter_outliers(
                                 f_extra_s, f_extra_r, f_extra_ids,
-                                threshold_multiplier=thr)
+                                threshold_multiplier=thr,
+                                upper_cutoff=cutoff)
                             create_speedup_vs_extra_hit_ratio_plot(
                                 f_extra_s2, f_extra_r2, f_extra_ids2,
                                 args.run1_label, args.run2_label,
@@ -1289,12 +1546,17 @@ def main():
 
             if run1_hit_ratios and len(run1_hit_ratios) > 0:
                 aligned_hit_ratios = _aligned_hit_ratios(speedup_request_ids)
+                aligned_total_tokens_plot = _aligned_total_tokens(speedup_request_ids)
 
                 if len(aligned_hit_ratios) == len(speedups):
                     create_speedup_vs_hit_ratio_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids)
                     create_speedup_vs_hit_ratio_log_plot(
                         speedups, aligned_hit_ratios, speedup_request_ids)
+                    create_3d_speedup_plot(
+                        speedups, aligned_hit_ratios, aligned_total_tokens_plot,
+                        speedup_request_ids,
+                        args.run1_label, args.run2_label)
 
             # Extra cache hit ratio interactive plot
             if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
@@ -1303,11 +1565,14 @@ def main():
                     args.run1_label, args.run2_label)
 
             # --- No-outlier versions (interactive) ---
-            if args.plot_no_outlier:
-                thr = args.outlier_threshold
+            if plot_no_outlier_enabled:
+                thr = no_outlier_threshold if no_outlier_threshold is not None else args.outlier_threshold
+                cutoff = args.speedup_cutoff
                 f_speedups, f_run1, f_run2, f_ids = filter_outliers(
                     speedups, run1_ttfts_common, run2_ttfts_common,
-                    speedup_request_ids, threshold_multiplier=thr)
+                    speedup_request_ids,
+                    threshold_multiplier=thr,
+                    upper_cutoff=cutoff)
 
                 create_ttft_comparison_scatter(
                     f_run1, f_run2, f_ids,
@@ -1317,11 +1582,15 @@ def main():
 
                 if run1_hit_ratios and len(run1_hit_ratios) > 0:
                     f_aligned = _aligned_hit_ratios(f_ids)
+                    f_aligned_tokens = _aligned_total_tokens(f_ids)
                     if len(f_aligned) == len(f_speedups):
                         create_speedup_vs_hit_ratio_plot(
                             f_speedups, f_aligned, f_ids)
                         create_speedup_vs_hit_ratio_log_plot(
                             f_speedups, f_aligned, f_ids)
+                        create_3d_speedup_plot(
+                            f_speedups, f_aligned, f_aligned_tokens, f_ids,
+                            args.run1_label, args.run2_label)
 
                 if extra_hit_ratios and len(extra_hit_ratios) > 0 and len(extra_hit_speedups) == len(extra_hit_ratios):
                     extra_map = dict(zip(extra_hit_request_ids, zip(extra_hit_speedups, extra_hit_ratios)))
@@ -1335,7 +1604,8 @@ def main():
                     if f_extra_r:
                         f_extra_s2, f_extra_r2, f_extra_ids2 = filter_outliers(
                             f_extra_s, f_extra_r, f_extra_ids,
-                            threshold_multiplier=thr)
+                            threshold_multiplier=thr,
+                            upper_cutoff=cutoff)
                         create_speedup_vs_extra_hit_ratio_plot(
                             f_extra_s2, f_extra_r2, f_extra_ids2,
                             args.run1_label, args.run2_label)
