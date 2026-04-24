@@ -6,9 +6,9 @@ The 3D surface plot of **speedup vs. cache hit ratio vs. total prompt tokens** (
 
 1. **Hit ratio drives speedup on average.** The fitted plane `speedup = 1.479 * hit_ratio + 1.09e-6 * total_tokens + 0.427` (R^2 = 0.610, n = 532 after outlier removal) shows that a 10pp increase in cache hit ratio yields ~0.15x additional speedup, while the total_tokens coefficient is effectively zero. The breakeven point (speedup = 1.0x) sits at approximately 39% cache hit ratio.
 
-2. **Small requests exhibit high speedup variance.** At total_tokens < 5,000, the point cloud fans vertically: some requests achieve 4--5x speedup while others drop below 0.5x. The coefficient of variation (CV) of the profile-time ratio in the <2k bucket is 0.113 -- seemingly low, but the absolute spread (0.465 to 0.756) is wide relative to the mean and the cloud is visually dispersed in the 3D plot because TTFT-level speedup (which includes the saved compute component) amplifies these differences. By contrast, the 10--30k bucket shows a CV of 0.211 but its points cluster much more tightly around the fitted surface because the per-step overhead is a smaller fraction of the total work.
+2. **Small requests exhibit high speedup variance.** At total_tokens < 5,000, the point cloud fans vertically: some requests achieve 4--5x speedup while others drop below 0.5x (see **Fig 1**: `speedup_by_bucket.png`). The <2k bucket has a standard deviation of 1.080 around a mean of 0.862, with an IQR of 0.080 but absolute range of 0.036 to 9.239. By contrast, the 5--10k bucket shows a tighter distribution with mean 0.996 and 33% of requests above breakeven.
 
-3. **Large requests converge onto the fitted surface.** Above 10,000 tokens, almost all points lie within a narrow band around the plane, indicating that blend mode is highly predictable for long-context workloads.
+3. **The high-hit / low-token corner is paradoxically noisy.** **Fig 2** (`speedup_by_bucket_high_hit.png`) isolates requests with cache hit ratio >= 50%. Even among these well-cached requests, the <2k bucket retains a massive spread (0.3x to 9.5x), while the 5--10k bucket collapses to a tight 1.9--2.5x band. A 99% cache hit ratio does not guarantee fast performance for small requests.
 
 ## 2. Root Cause: Scheduler-Induced Chunked-Prefill Fragmentation
 
@@ -25,67 +25,65 @@ vLLM's chunked-prefill scheduler (`vllm/v1/core/scheduler.py`) decides how many 
 
 ### 2.2 Fragmentation Disproportionately Hits Small Requests
 
-Cross-tabulating op count against token bucket reveals that **small requests are 3.4x more likely to land in the 36-op (fragmented) bucket**:
+**Fig 3** (`fragmentation_rate.png`) cross-tabulates the fragmentation rate against prompt length:
 
-| Token bucket | 4-op (%) | 36-op (%) |
-|---|---|---|
-| < 2,000 | 55% | **45%** |
-| 2--5,000 | 79% | 21% |
-| 5--10,000 | 90% | 10% |
-| 10--30,000 | 71% | 29% |
-| > 30,000 | 87% | 13% |
+| Token bucket | 1-step (4-op) | 9-step (36-op) | Fragmentation rate |
+|---|---|---|---|
+| < 2,000 | 53 | 43 | **45%** |
+| 2--5,000 | 78 | 21 | 21% |
+| 5--10,000 | 111 | 12 | 10% |
+| 10--30,000 | 41 | 17 | 29% |
+| > 30,000 | 39 | 6 | 13% |
 
-Small prompts are more susceptible because they fill a smaller portion of `max_num_batched_tokens`, leaving room for the scheduler to pack decode steps alongside them and defer their remaining tokens to subsequent batches.
+Small prompts are most susceptible (45% fragmentation rate, 3.4x the rate of 5--10k requests) because they fill a smaller portion of `max_num_batched_tokens`, leaving room for the scheduler to pack decode steps alongside them and defer their remaining tokens to subsequent batches.
 
-### 2.3 Per-Step Overhead is Fixed-Cost, Not Proportional to Tokens
+### 2.3 Per-Step Overhead: Measured Phase-Level Breakdown
 
-Each call to `retrieve_layer` in `cache_engine.py:598` triggers a chain of fixed-cost operations:
+**Fig 4** (`phase_breakdown.png`) shows the measured per-call cost of `retrieve_layer`, broken down by phase group, for blend vs. no-blend:
 
-1. **Token database lookup** (`cache_engine.py:616`, phase `retrieve_layer.token_db`): walks the token sequence to identify cached chunks. Cost: ~1.4 ms per call regardless of how many tokens are in the step.
+| Phase group | Blend (ms) | No Blend (ms) | Description |
+|---|---|---|---|
+| Token DB Lookup | 0.7 | 0.3 | `cache_engine.py:616`, walks token sequence to identify cached chunks |
+| Storage Get | 2.0 | 3.1 | `cache_engine.py:680`, fetches each layer's KV from the CPU backend |
+| GPU Onload | **28.1** | **14.6** | `cache_engine.py:694` -> `gpu_connector.py:936--968`, copies KV into vLLM's paged buffer |
+| **Total** | **30.8** | **18.0** | **Ratio: 1.72x** |
 
-2. **Per-layer storage retrieval** (`cache_engine.py:680`, phase `retrieve_layer.storage_get_L{i}`): fetches each layer's KV cache from the CPU storage backend. Cost: ~0.3 ms x 36 layers = ~10.8 ms.
+The dominant cost is **GPU Onload** (91% of blend's per-call time), where the blend path pays an additional ~13.5 ms per call. This extra cost comes from the blender's gap-aware recomputation: `blender.py:59--139` (`process_qkv`) selects the top 15% most-divergent token positions per layer (`topk_num = int(total_len * recomp_ratios[0])` at line 99) and recomputes their KV state (lines 101--122), plus the GPU work of comparing fresh vs. cached keys (`diff_k` at lines 91--93).
 
-3. **Per-layer GPU onload** (`cache_engine.py:694`, phase `retrieve_layer.gpu_onload_L{i}`): copies KV data into vLLM's paged KV buffer via the GPU connector (`gpu_connector.py:936--968`). Cost: ~0.4 ms x 36 layers = ~14.4 ms.
-
-Measured totals per `retrieve_layer` call:
-
-| Mode | Median | P10 | P90 | Mean |
-|---|---|---|---|---|
-| **Blend** | 27.2 ms | 22.3 ms | 42.2 ms | 30.8 ms |
-| **No-blend** | 16.7 ms | 12.1 ms | 28.1 ms | 18.0 ms |
-| **Ratio** | **1.63x** | 1.84x | 1.50x | **1.71x** |
-
-The ~14 ms difference between blend and no-blend comes from the blender's gap-aware recomputation: `blender.py:59--139` (`process_qkv`) selects the top `recomp_ratio * total_len` (i.e., 15%) most-divergent token positions per layer and recomputes their KV state (lines 96--122), plus the additional GPU work of comparing fresh vs. cached keys (`diff_k` at line 91--93) and sorting gap positions (lines 101--122).
+**Data source**: 4,852 blend `retrieve_layer` calls and 3,092 no-blend calls from the profiler JSONLs (`lmcache_profile_20260408_044806_advprof_chunklb128.jsonl` and `lmcache_profile_20260408_062217_advprof_noblend.jsonl`).
 
 ### 2.4 Why Fixed Cost Dominates Small Requests
 
 For a 1,000-token request fragmented across 9 steps:
 - Each step processes ~111 tokens.
-- Each step incurs ~27 ms of blend retrieve overhead.
-- Total overhead: 9 steps x 27 ms x 4 TP workers' worth of records = **~972 ms** of aggregate profile time.
+- Each step incurs ~30.8 ms of blend retrieve overhead.
+- Total overhead: 9 steps x 30.8 ms x 4 TP workers' worth of records = **~1,109 ms** of aggregate profile time.
 - Baseline cost (no-blend, no fragmentation): ~114 ms TTFT for straight prefill of 1,000 tokens.
 
-The retrieve overhead alone is **8.5x** the entire no-blend TTFT. Even though cache hits save the GPU compute on 90%+ of the prompt tokens, the savings (~100 ms of prefill compute) are dwarfed by the 972 ms of per-step LMCache overhead.
+The retrieve overhead alone is **9.7x** the entire no-blend TTFT. Even though cache hits save the GPU compute on 90%+ of the prompt tokens, the savings (~100 ms of prefill compute) are dwarfed by the per-step LMCache overhead.
 
 For a 50,000-token request fragmented across the same 9 steps:
 - Each step processes ~5,556 tokens.
-- Same 27 ms per-step overhead, so total overhead is unchanged at ~972 ms.
+- Same 30.8 ms per-step overhead, so total overhead is unchanged at ~1,109 ms.
 - Baseline cost: ~5,000 ms TTFT for straight prefill.
-- The 972 ms overhead is **19%** of baseline, and cache hits save ~4,500 ms of compute.
+- The 1,109 ms overhead is **22%** of baseline, and cache hits save ~4,500 ms of compute.
 - Net speedup: ~2x, closely matching the fitted surface.
 
 **The core asymmetry**: the per-step overhead is invariant to the number of tokens in the step, but the compute savings scale linearly with token count. Small requests sit below the crossover where overhead > savings.
 
 ## 3. Why the Variance (Not Just the Mean) is High for Small Requests
 
-Two identically sized, identically cached small requests can land on opposite sides of the speedup distribution based on a **single scheduler decision**: whether they get 1 prefill step (4 ops) or 9 steps (36 ops).
+**Fig 5** (`speedup_vs_tokens_fragmentation.png`) plots speedup vs. total_tokens on a log scale, with points colored by fragmentation class (blue circles = 1 prefill step, orange diamonds = 9 steps).
 
-- **1 step (4 ops)**: total LMCache overhead ~4 x 27 ms = ~108 ms. If baseline is 114 ms and cache saves 100 ms of compute, TTFT ~ 108 + 14 = 122 ms. Speedup ~ 114/122 = 0.93x (slight regression, but close to parity).
-- **9 steps (36 ops)**: total overhead ~36 x 27 ms = ~972 ms. TTFT ~ 972 + 14 = 986 ms. Speedup ~ 114/986 = 0.12x (severe regression).
+Two patterns emerge:
 
-Same request, same cache state, 8x difference in speedup -- driven entirely by the scheduler's batching decision at the time of arrival. This is why the 3D plot shows a **fan-shaped spread** at low total_tokens rather than a tight cluster.
+1. **Non-fragmented small requests (blue, 4-op)** cluster tightly at ~0.5x speedup (mean = 0.538, std = 0.031 for <2k tokens). Blend overhead is consistent and always exceeds the compute savings for these short prompts. **This is predictable but consistently below breakeven.**
 
-For large requests, both 1-step and 9-step scenarios produce per-step token counts large enough that the fixed overhead is a small fraction of per-step compute, so the fan closes.
+2. **Fragmented small requests (orange, 36-op)** show the full spread from 0x to 9.5x (mean = 1.604, std = 1.786 for <2k tokens). The variance is driven by the interaction between the number of scheduler steps and the cache hit pattern across those steps -- some fragmented requests encounter favorable cache timing where cached content is warm from earlier steps, while others pay the full overhead with minimal cache benefit.
+
+The key insight from Fig 5 is that **fragmentation is both the source of the worst under-performers AND the best over-performers** for small requests. The scheduler's batching decision at arrival time determines which side a request lands on, and this decision is not correlated with the request's cache state.
+
+For large requests (>10k tokens), both fragmentation classes converge to the same narrow band because the per-step overhead is a small fraction of per-step compute regardless of how many steps the scheduler chose.
 
 ## 4. Implications and Potential Improvements
 
@@ -93,15 +91,15 @@ For large requests, both 1-step and 9-step scenarios produce per-step token coun
 
 **Concept**: In `vllm_v1_adapter.py:start_load_kv()`, before entering the retrieve path, check the number of tokens allocated to this scheduler step for the current request. If below a threshold (e.g., 256 tokens), skip the LMCache retrieve and let vLLM do normal prefill for those tokens.
 
-**Trade-off**: Loses cache benefit for micro-batched steps, but those steps are exactly where the overhead exceeds the benefit. The threshold can be tuned per-deployment based on the per-call overhead profile (27 ms blend, 17 ms no-blend).
+**Trade-off**: Loses cache benefit for micro-batched steps, but those steps are exactly where the overhead exceeds the benefit. The threshold can be tuned per-deployment based on the per-call overhead profile (30.8 ms blend, 18.0 ms no-blend).
 
 **Implementation site**: The per-request loop in `vllm_v1_adapter.py` (currently line 821). Before calling `retrieve_layer()` or `retrieve()`, check `len(request.token_ids) < MIN_TOKENS_FOR_CACHE_LOOKUP` and skip if true.
 
 ### 4.2 Approach B: Prompt-Length-Aware Blend Bypass
 
-**Concept**: For requests with `total_tokens < N` (e.g., N = 2,000), bypass the blend path entirely at the server level or the adapter level. Small prompts are cheap to recompute from scratch, and the data shows blend is net-negative for most sub-2k requests in the fragmented bucket.
+**Concept**: For requests with `total_tokens < N` (e.g., N = 2,000), bypass the blend path entirely at the server level or the adapter level. Small prompts are cheap to recompute from scratch, and the data shows blend is net-negative for most sub-2k requests in the non-fragmented bucket (mean 0.54x).
 
-**Trade-off**: Loses non-prefix cache reuse for small prompts. But sub-2k prompts represent only ~23% of the request population (96 / 421), and their cache savings are modest in absolute terms (saving ~100 ms of compute vs. paying ~100--1,000 ms of overhead depending on fragmentation).
+**Trade-off**: Loses non-prefix cache reuse for small prompts. But sub-2k prompts represent only ~27% of the request population (145 / 536), and their cache savings are modest in absolute terms (saving ~100 ms of compute vs. paying ~100--1,000 ms of overhead depending on fragmentation).
 
 **Implementation site**: `blend_server_ttft.py`, immediately before invoking the blend path. Check `len(prompt_tokens)` and route to the no-blend path (`messages_to_prompt_no_blend`) when below threshold.
 
@@ -125,15 +123,31 @@ The fragmentation effect is **not** a fundamental limitation of CacheBlend's cac
 
 The current behavior can be characterized as a **necessary evil of the streaming chunked-prefill architecture**: the scheduler's freedom to interleave prefill and decode steps is what makes vLLM's TTFT competitive for large requests, and LMCache's per-step overhead is the price of hooking into that streaming model. For production deployments where the request length distribution is known (as in this thesis's Django trace), Approach A or B provides an effective, low-cost mitigation.
 
-## 5. Summary of Key Evidence
+## 5. Figures Reference
+
+| Figure | File | Description |
+|---|---|---|
+| Fig 1 | `speedup_by_bucket.png` | Violin + box plot: speedup distribution by token bucket (all requests) |
+| Fig 2 | `speedup_by_bucket_high_hit.png` | Same, filtered to cache hit ratio >= 50%. Shows the paradox: high-hit small requests still have massive variance |
+| Fig 3 | `fragmentation_rate.png` | Stacked bar: chunked-prefill fragmentation rate by token bucket. 45% of <2k requests vs 10% of 5--10k |
+| Fig 4 | `phase_breakdown.png` | Grouped bar: per-call `retrieve_layer` phase cost (blend vs no-blend). GPU Onload is 1.93x, total is 1.72x |
+| Fig 5 | `speedup_vs_tokens_fragmentation.png` | Scatter: speedup vs total_tokens (log scale) colored by fragmentation class. Orange diamonds (36-op) show full variance spread; blue circles (4-op) cluster tightly |
+| Fig 6 | `speedup_3d_no_outlier.png` | 3D surface: speedup vs hit_ratio vs total_tokens with plane fit (from compare_lmcache_runs.py) |
+
+All figures produced by `analyze_variance.py` (Figs 1--5) and `compare_lmcache_runs.py` (Fig 6). PNG and PDF versions available.
+
+## 6. Summary of Key Evidence
 
 | Metric | Value | Source |
 |---|---|---|
-| Plane fit (no outliers) | `speedup = 1.479 * hit + 1.1e-6 * tokens + 0.427` | `compare_lmcache_runs.py` |
-| R^2 with / without outliers | 0.193 / 0.610 | 3D plot stdout |
+| Plane fit (no outliers) | `speedup = 1.479 * hit + 1.1e-6 * tokens + 0.427` | 3D plane fit (compare_lmcache_runs.py) |
+| R^2 with / without outliers | 0.193 / 0.610 | 3D plane fit stdout |
 | Breakeven hit ratio | ~39% | Plane intercept at speedup = 1.0 |
-| Blend per-call overhead | 27.2 ms median (1.71x vs. no-blend) | Profiler JSONL |
-| Fragmented (36-op) fraction | 99 / 421 = 23.5% of requests | Profiler JSONL |
-| Small-request fragmentation rate | 45% of <2k tokens (vs. 13% of >30k) | Profiler JSONL |
-| Worst-case overhead multiplier | 9 steps x 4 TP x 27 ms = 972 ms | Profiler JSONL |
+| Blend per-call retrieve_layer cost | 30.8 ms mean (1.72x vs. no-blend 18.0 ms) | Profiler JSONL phase breakdown (Fig 4) |
+| GPU Onload per-call cost | 28.1 ms blend vs 14.6 ms no-blend (1.93x) | Profiler JSONL phase breakdown (Fig 4) |
+| Fragmented (36-op) fraction | 99 / 421 = 23.5% of requests | Profiler JSONL op count |
+| Small-request fragmentation rate | 45% of <2k tokens (vs. 10% of 5--10k) | Fragmentation cross-tab (Fig 3) |
+| <2k non-fragmented speedup | mean=0.538, std=0.031 (tight, below breakeven) | Numerical summary |
+| <2k fragmented speedup | mean=1.604, std=1.786 (high variance, spans both sides) | Numerical summary |
+| Worst-case overhead multiplier | 9 steps x 4 TP x 30.8 ms = 1,109 ms | Profiler JSONL |
 | Baseline TTFT for 1k-token request | ~114 ms | No-blend run .out |
