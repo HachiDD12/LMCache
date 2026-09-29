@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import array
+import hashlib
 import os
 import uuid
 
@@ -261,6 +264,13 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Blend mode only: a running request with an identical prompt whose
+    # blended KV is already in vLLM's paged buffer. When set, the worker
+    # copies that KV instead of re-running blend for this request.
+    kv_donor_req_id: Optional[str] = None
+    # Blend mode only: this request's blended KV may be copied by later
+    # requests with the same prompt, so the worker must remember its slots.
+    is_kv_donor: bool = False
 
     @staticmethod
     def from_request_tracker(
@@ -550,6 +560,9 @@ def _init_lmcache_engine(
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
     lookup_requests_in_step: list[str] = field(default_factory=list)
+    # Blend mode only: donor requests the scheduler no longer vouches for
+    # (finished or preempted), so workers can drop their slot mappings.
+    kv_donor_evicted_req_ids: list[str] = field(default_factory=list)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -676,6 +689,35 @@ class LMCacheConnectorV1Impl:
 
         self._requests_priority: dict[str, int] = {}
 
+        # Blend mode: store the whole prompt, not just the tokens past
+        # `max_hit_end`. With non-contiguous hits, `max_hit_end` is the end
+        # of the last hit chunk, so treating it as "already saved" skipped
+        # every gap chunk before it. `store_layer` skips chunks that are
+        # already cached, so only the gaps and the tail are written.
+        self._blend_save_gaps = os.environ.get(
+            "LMCACHE_BLEND_SAVE_GAPS", "1"
+        ).lower() not in ("0", "false", "no")
+
+        # Blend mode: blend each distinct prompt once. Requests with an
+        # identical prompt (e.g. the n parallel-sampling children of one
+        # parent) copy the donor's blended KV instead of blending again.
+        # The scheduler side decides the donor and only names one that is
+        # still RUNNING, so its blocks are guaranteed to be allocated; every
+        # TP worker receives the same decision, so the collectives inside
+        # blend stay aligned across ranks.
+        self._blend_dedup = os.environ.get(
+            "LMCACHE_BLEND_SIBLING_DEDUP", "1"
+        ).lower() not in ("0", "false", "no")
+        # scheduler side: prompt digest -> (donor req_id, blended token count)
+        self._kv_donor_by_digest: dict[bytes, tuple[str, int]] = {}
+        self._kv_donor_digest_by_req: dict[str, bytes] = {}
+        self._kv_donor_evicted: list[str] = []
+        # worker side: donor req_id -> (GPU slot mapping, blended token count)
+        self._kv_donor_slots: "OrderedDict[str, tuple[torch.Tensor, int]]" = (
+            OrderedDict()
+        )
+        self._kv_donor_slots_cap = 4096
+
         # TODO(baoloongmao): Internal api server & plugin framework support dp > 1
         if vllm_config.parallel_config.data_parallel_rank_local == 0:
             # Start internal API server if enabled
@@ -799,6 +841,9 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
+        for req_id in metadata.kv_donor_evicted_req_ids:
+            self._kv_donor_slots.pop(req_id, None)
+
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
@@ -856,13 +901,52 @@ class LMCacheConnectorV1Impl:
                         sync = False
                     # NOTE(Jiayi): Perform blending before layerwise prefix caching
                     if self.enable_blending:
-                        # TODO(Jiayi): Need to make prefix caching and blending compatible
-                        self.blender.blend(
-                            tokens[:lmcache_cached_tokens],
-                            token_mask[:lmcache_cached_tokens],
-                            kvcaches=kvcaches,
-                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        )
+                        dst_slots = slot_mapping[:lmcache_cached_tokens]
+                        donor = self._kv_donor_slots.get(request.kv_donor_req_id)
+                        if (
+                            request.kv_donor_req_id is not None
+                            and donor is not None
+                            and donor[1] >= lmcache_cached_tokens
+                        ):
+                            with _profiler.phase(
+                                "adapter.start_load_kv.sibling_kv_copy"
+                            ):
+                                self._copy_paged_kv(
+                                    kvcaches, donor[0][:lmcache_cached_tokens],
+                                    dst_slots,
+                                )
+                            logger.debug(
+                                "Copied %d blended tokens from %s to %s",
+                                lmcache_cached_tokens,
+                                request.kv_donor_req_id,
+                                request.req_id,
+                            )
+                        else:
+                            if request.kv_donor_req_id is not None:
+                                # Deterministic across ranks: every worker
+                                # holds the same donor table.
+                                logger.warning(
+                                    "Donor %s unavailable for %s; blending",
+                                    request.kv_donor_req_id,
+                                    request.req_id,
+                                )
+                            # A stale entry under this id must not survive
+                            # if this blend is interrupted.
+                            self._kv_donor_slots.pop(request.req_id, None)
+                            # TODO(Jiayi): Need to make prefix caching and
+                            # blending compatible
+                            self.blender.blend(
+                                tokens[:lmcache_cached_tokens],
+                                token_mask[:lmcache_cached_tokens],
+                                kvcaches=kvcaches,
+                                slot_mapping=dst_slots,
+                            )
+                            if request.is_kv_donor:
+                                self._kv_donor_slots[request.req_id] = (
+                                    dst_slots, lmcache_cached_tokens,
+                                )
+                                if len(self._kv_donor_slots) > self._kv_donor_slots_cap:
+                                    self._kv_donor_slots.popitem(last=False)
                     else:
                         with _profiler.phase("adapter.start_load_kv.retrieve_layer_init"):
                             layerwise_retriever = self.lmcache_engine.retrieve_layer(
@@ -902,6 +986,35 @@ class LMCacheConnectorV1Impl:
                             num_retrieved_tokens,
                             num_expected_tokens,
                         )
+
+    def _copy_paged_kv(
+        self,
+        kvcaches: list[torch.Tensor],
+        src_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+    ) -> None:
+        """Copy KV between slots of vLLM's paged buffer, for every layer.
+
+        Runs on the current stream, so it is ordered after the donor's blend,
+        whose paged-buffer writes are issued on the same stream.
+        """
+        assert len(src_slots) == len(dst_slots)
+        two_major = getattr(
+            self.lmcache_engine.gpu_connector,
+            "vllm_two_major",
+            kvcaches[0].shape[0] == 2,
+        )
+        # [2, num_blocks, block_size, ...] or [num_blocks, 2, block_size, ...]
+        block_size = kvcaches[0].shape[2]
+        src_slots = src_slots.to(kvcaches[0].device)
+        dst_slots = dst_slots.to(kvcaches[0].device)
+        sb, so = src_slots // block_size, src_slots % block_size
+        db, do = dst_slots // block_size, dst_slots % block_size
+        for kv in kvcaches:
+            if two_major:
+                kv[:, db, do] = kv[:, sb, so]
+            else:
+                kv[db, :, do] = kv[sb, :, so]
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -1341,6 +1454,20 @@ class LMCacheConnectorV1Impl:
         meta.lookup_requests_in_step = self._lookup_requests_in_step
         self._lookup_requests_in_step = []
 
+        # Stop vouching for donors whose blocks may no longer hold their
+        # blended KV: finished (blocks freed) or preempted (blocks freed; a
+        # resumed request gets new blocks and does not re-blend).
+        for donor_id in list(self._kv_donor_digest_by_req):
+            donor = self._unfinished_requests.get(donor_id)
+            if (
+                donor_id in scheduler_output.finished_req_ids
+                or donor is None
+                or getattr(donor.status, "name", None) != "RUNNING"
+            ):
+                self._evict_kv_donor(donor_id)
+        meta.kv_donor_evicted_req_ids = self._kv_donor_evicted
+        self._kv_donor_evicted = []
+
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -1362,11 +1489,43 @@ class LMCacheConnectorV1Impl:
                 and request_priority > self.config.priority_limit
             )
 
+            # Tokens LMCache already holds and need not be stored again. In
+            # blend mode the hit chunks are non-contiguous, so no prefix is
+            # known to be fully cached; store from 0 and let `store_layer`
+            # skip the chunks that exist.
+            saved_prefix = lmcache_cached_tokens
+            if self.config.enable_blending and self._blend_save_gaps:
+                saved_prefix = 0
+
+            kv_donor_req_id = None
+            is_kv_donor = False
+            if (
+                self.config.enable_blending
+                and self._blend_dedup
+                and load_spec is not None
+                and load_spec.can_load
+                and lmcache_cached_tokens > 0
+                and not getattr(request, "mm_hashes", None)
+                and not getattr(request, "mm_features", None)
+            ):
+                digest = self._prompt_digest(request.prompt_token_ids)
+                entry = self._kv_donor_by_digest.get(digest)
+                if entry is None:
+                    self._kv_donor_by_digest[digest] = (
+                        request.req_id, lmcache_cached_tokens,
+                    )
+                    self._kv_donor_digest_by_req[request.req_id] = digest
+                    is_kv_donor = True
+                elif entry[1] >= lmcache_cached_tokens:
+                    kv_donor_req_id = entry[0]
+                    # The donor stores this same prompt.
+                    skip_save = True
+
             request_tracker = RequestTracker.from_new_request(
                 self.config,
                 request,
                 num_tokens_to_compute,
-                lmcache_cached_tokens,
+                saved_prefix,
                 skip_save,
             )
             self._request_trackers[request.req_id] = request_tracker
@@ -1380,6 +1539,8 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
+                req_meta.kv_donor_req_id = kv_donor_req_id
+                req_meta.is_kv_donor = is_kv_donor
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -1433,12 +1594,31 @@ class LMCacheConnectorV1Impl:
 
         return meta
 
+    @staticmethod
+    def _prompt_digest(token_ids: list[int]) -> bytes:
+        body = hashlib.blake2b(
+            array.array("q", token_ids).tobytes(), digest_size=16
+        ).digest()
+        return len(token_ids).to_bytes(8, "little") + body
+
+    def _evict_kv_donor(self, req_id: str) -> None:
+        digest = self._kv_donor_digest_by_req.pop(req_id, None)
+        if digest is None:
+            return
+        entry = self._kv_donor_by_digest.get(digest)
+        if entry is not None and entry[0] == req_id:
+            del self._kv_donor_by_digest[digest]
+        self._kv_donor_evicted.append(req_id)
+
     @_lmcache_nvtx_annotate
     def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # Called before the request's blocks are freed.
+        self._evict_kv_donor(request.request_id)
+
         params = (
             request.kv_transfer_params
             if hasattr(request, "kv_transfer_params")
