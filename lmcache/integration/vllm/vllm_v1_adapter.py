@@ -271,6 +271,16 @@ class ReqMeta:
     # Blend mode only: this request's blended KV may be copied by later
     # requests with the same prompt, so the worker must remember its slots.
     is_kv_donor: bool = False
+    # Load view, set only when the save view (`token_ids`/`slot_mapping`) is
+    # shorter than the tokens to load. The save view is cut down to a chunk
+    # boundary during chunked prefill, which can fall below
+    # `lmcache_cached_tokens`; the load must still cover all of them, since
+    # vLLM treats them as computed and will not prefill them itself.
+    load_token_ids: Optional[list[int]] = None
+    load_slot_mapping: Optional[torch.Tensor] = None
+    # Whether `token_ids` reaches the end of the prompt. False during a
+    # chunked-prefill step, when the prompt continues past the save view.
+    save_tokens_complete: bool = True
 
     @staticmethod
     def from_request_tracker(
@@ -280,6 +290,7 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        save_on_last_prefill: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -290,6 +301,10 @@ class ReqMeta:
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
             save_decode_cache (bool): whether to save the cache in decode phase.
+            save_on_last_prefill (bool): always save in the step that finishes
+                the prefill, even if it adds less than one LMCache chunk.
+                Needed in blend mode, where earlier steps leave out a segment
+                that is still being prefilled and only this step can store it.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -318,7 +333,11 @@ class ReqMeta:
 
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
+            or (
+                tracker.num_saved_tokens > 0
+                and input_token_len < chunk_boundary
+                and not (save_on_last_prefill and is_last_prefill)
+            )
             or (tracker.is_decode_phase and not save_decode_cache)
             or request_skip
         )
@@ -343,8 +362,16 @@ class ReqMeta:
             tracker.num_saved_tokens = num_tokens_to_save
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
+        # The load needs `lmcache_cached_tokens` tokens even when the save
+        # view is shorter. `input_token_ids` always covers them: vLLM counts
+        # them as computed, so they are within num_computed + num_scheduled.
+        num_tokens_to_load = 0
+        if load_spec is not None and load_spec.can_load:
+            num_tokens_to_load = min(load_spec.lmcache_cached_tokens, input_token_len)
+        num_tokens_in_view = max(num_tokens_to_save, num_tokens_to_load)
+
         # Calculate the token ids and slot mappings for load and save
-        token_ids = input_token_ids[:num_tokens_to_save]
+        token_ids = input_token_ids[:num_tokens_in_view]
 
         # If the request has multimodal hashes, apply them to the token ids
         if tracker.mm_hashes:
@@ -382,6 +409,14 @@ class ReqMeta:
         slot_mapping = slot_mapping.flatten()[: len(token_ids)]
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
+        load_token_ids = None
+        load_slot_mapping = None
+        if num_tokens_to_load > num_tokens_to_save:
+            load_token_ids = token_ids[:num_tokens_to_load]
+            load_slot_mapping = slot_mapping[:num_tokens_to_load]
+        token_ids = token_ids[:num_tokens_to_save]
+        slot_mapping = slot_mapping[:num_tokens_to_save]
+
         # For load operation: check whether the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
             logger.debug(
@@ -402,6 +437,9 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            load_token_ids=load_token_ids,
+            load_slot_mapping=load_slot_mapping,
+            save_tokens_complete=num_tokens_to_save >= tracker.prompt_len,
         )
 
 
@@ -604,6 +642,23 @@ class LMCacheConnectorV1Impl:
                             f"extra config: {value}"
                         )
 
+        # Blend mode: cap segment length at the per-step token budget, so a
+        # segment longer than one prefill step is keyed as pieces of at most
+        # one step. Set before either role builds its SegmentTokenDatabase;
+        # both roles read the same scheduler config, so they cut identically.
+        if (
+            config.enable_blending
+            and getattr(config, "blend_max_segment_tokens", None) is None
+        ):
+            config.blend_max_segment_tokens = (
+                vllm_config.scheduler_config.max_num_batched_tokens
+            )
+            logger.info(
+                "Blend segments are keyed in pieces of at most %d tokens "
+                "(max_num_batched_tokens)",
+                config.blend_max_segment_tokens,
+            )
+
         self.config = config
 
         self.async_loading = config.enable_async_loading
@@ -697,6 +752,14 @@ class LMCacheConnectorV1Impl:
         self._blend_save_gaps = os.environ.get(
             "LMCACHE_BLEND_SAVE_GAPS", "1"
         ).lower() not in ("0", "false", "no")
+        # Blend mode stores from token 0 in every prefill step. A segment
+        # still being prefilled is left out of a step's store (its key would
+        # not match the finished segment), so it starts before that step's
+        # end and must still be eligible in a later step. Pieces already in
+        # the cache are skipped by `store_layer`, so only new ones are written.
+        self._blend_store_from_start = (
+            config.enable_blending and self._blend_save_gaps
+        )
 
         # Blend mode: blend each distinct prompt once. Requests with an
         # identical prompt (e.g. the n parallel-sampling children of one
@@ -878,8 +941,13 @@ class LMCacheConnectorV1Impl:
                 num_tokens=len(request.token_ids),
             ):
                 tokens = request.token_ids
+                slot_mapping = request.slot_mapping
+                if request.load_token_ids is not None:
+                    # The save view was cut below the tokens to load.
+                    tokens = request.load_token_ids
+                    slot_mapping = request.load_slot_mapping
                 # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = request.slot_mapping.cuda()
+                slot_mapping = slot_mapping.cuda()
                 assert len(tokens) == len(slot_mapping)
 
                 self._stats_monitor.update_interval_vllm_hit_tokens(
@@ -1110,7 +1178,7 @@ class LMCacheConnectorV1Impl:
                     # TODO: have a pre-allocated buffer to hold the slot_mappings
                     slot_mapping = slot_mapping.cuda()
 
-                    if self.kv_role == "kv_producer":
+                    if self.kv_role == "kv_producer" or self._blend_store_from_start:
                         skip_leading_tokens = 0
                     else:
                         skip_leading_tokens = save_spec.skip_leading_tokens
@@ -1145,6 +1213,7 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping,
                         offset=skip_leading_tokens,
                         sync=is_first,
+                        tokens_complete=request.save_tokens_complete,
                     )
                     self.layerwise_storers.append(layerwise_storer)
                     if is_first:
@@ -1211,6 +1280,8 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = min(
                         skip_leading_tokens, request.disagg_spec.num_transferred_tokens
                     )
+                elif self._blend_store_from_start:
+                    skip_leading_tokens = 0
 
                 if skip_leading_tokens == len(token_ids):
                     continue  # skip this request
@@ -1255,6 +1326,7 @@ class LMCacheConnectorV1Impl:
                         offset=skip_leading_tokens,
                         transfer_spec=request.disagg_spec,
                         request_configs=request.request_configs,
+                        tokens_complete=request.save_tokens_complete,
                     )
 
                 # NOTE(Jiayi): We assume all tokens are saved
@@ -1537,6 +1609,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self._save_decode_cache,
+                save_on_last_prefill=self._blend_store_from_start,
             )
             if req_meta is not None:
                 req_meta.kv_donor_req_id = kv_donor_req_id
@@ -1559,6 +1632,7 @@ class LMCacheConnectorV1Impl:
                     self._lmcache_chunk_size,
                     load_spec=None,
                     discard_partial_chunks=self._discard_partial_chunks,
+                    save_on_last_prefill=self._blend_store_from_start,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
@@ -1588,6 +1662,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=None,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self._save_decode_cache,
+                save_on_last_prefill=self._blend_store_from_start,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)

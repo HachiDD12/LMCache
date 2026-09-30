@@ -152,6 +152,14 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "blend_min_tokens": {"type": int, "default": 256, "env_converter": int},
     "blend_special_str": {"type": str, "default": " # # ", "env_converter": str},
+    # Segments longer than this are cut into pieces of at most this many
+    # tokens, counted from the segment start. None: the vLLM adapter uses
+    # the engine's max_num_batched_tokens. 0: never cut.
+    "blend_max_segment_tokens": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
     # P2P configurations
     "enable_p2p": {
         "type": bool,

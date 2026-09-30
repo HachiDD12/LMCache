@@ -86,6 +86,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        tokens_complete: bool = True,
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -105,6 +106,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             If False, the hash value will be returned instead.
 
         :param Optional[dict] request_configs: The configs of the request.
+
+        :param bool tokens_complete: False when `tokens` is a strict prefix of
+            the prompt, as in a chunked-prefill step, so its last chunk may
+            still grow. Implementations whose keys depend on where that chunk
+            ends must then leave it out.
 
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
@@ -223,8 +229,12 @@ class ChunkedTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        tokens_complete: bool = True,
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
         """Process the tokens/hashes and return the corresponding cache engine keys.
+
+        `tokens_complete` is ignored: prefix-hashed fixed-size chunks do not
+        depend on where the token list ends. Callers store only full chunks.
 
         :param Optional[Union[torch.Tensor, List[int]]] tokens: The tokens to process.
 
@@ -306,8 +316,16 @@ class SegmentTokenDatabase(TokenDatabase):
     """
 
     def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
-        super(SegmentTokenDatabase, self).__init__(config, metadata)        
-        
+        super(SegmentTokenDatabase, self).__init__(config, metadata)
+
+        # Segments longer than this are keyed as consecutive pieces of this
+        # size, counted from the segment start (0 = never cut). Every
+        # instance that stores, retrieves or looks up KV must use the same
+        # value, so it comes from the shared engine config.
+        self.max_segment_tokens = int(
+            getattr(config, "blend_max_segment_tokens", None) or 0
+        )
+
         if (HACHIS_USING_DEVSTRAL):
             # temp fix for devstral, this need to be better handled later if using other models
             logger.debug(f"Temp fix using Devstral Tekkenizer\nmetadata model name: {metadata.model_name}")
@@ -332,6 +350,7 @@ class SegmentTokenDatabase(TokenDatabase):
 
         if self.sep_len == 0 or len(tokens) < self.sep_len:
             yield tokens
+            return
 
         # Unfold into sliding windows
         # shape: (num_tokens-sep_len+1, sep_len)
@@ -358,8 +377,14 @@ class SegmentTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        tokens_complete: bool = True,
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
         """Process the tokens and return the corresponding cache engine keys.
+
+        Each separator-delimited segment is keyed by the hash of its own
+        tokens. A segment longer than `max_segment_tokens` is keyed as
+        consecutive pieces of that size counted from the segment start, so
+        the pieces depend only on the segment's content.
 
         :param Union[torch.Tensor, List[int]] tokens: The tokens to process.
 
@@ -380,6 +405,12 @@ class SegmentTokenDatabase(TokenDatabase):
             If False, the hash value will be returned instead.
 
         :param Optional[dict] request_configs: The configs of the request.
+
+        :param bool tokens_complete: False when `tokens` is a strict prefix of
+            the prompt (a chunked-prefill step). The last piece may then be cut
+            short by the step boundary, which would give it a key that the
+            full piece never matches, so it is not emitted. It is emitted by a
+            later call, once the prompt is prefilled past its end.
 
         :returns: An iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
@@ -414,18 +445,37 @@ class SegmentTokenDatabase(TokenDatabase):
                 len(tokens), self.sep_tokens.tolist(), len(token_chunks),
                 [len(c) for c in token_chunks]
             )
+            # (start, end, tokens) of every keyed piece, in prompt order
+            pieces = []
             start_idx = 0
             for idx, token_chunk in enumerate(token_chunks):
-                token_chunk_len = len(token_chunk)
-                end_idx = start_idx + token_chunk_len
                 if idx > 0:
                     start_idx += self.sep_len
-                    end_idx += self.sep_len
-                chunk_hash = self._hash_tokens(token_chunk)
+                token_chunk_len = len(token_chunk)
+                cap = self.max_segment_tokens
+                if cap > 0 and token_chunk_len > cap:
+                    for off in range(0, token_chunk_len, cap):
+                        piece = token_chunk[off : off + cap]
+                        pieces.append(
+                            (start_idx + off, start_idx + off + len(piece), piece)
+                        )
+                else:
+                    pieces.append(
+                        (start_idx, start_idx + token_chunk_len, token_chunk)
+                    )
+                start_idx += token_chunk_len
+
+            if not tokens_complete and pieces:
+                # The prompt continues past `tokens`: the last piece (or a
+                # separator cut in half, which lands in it) may be unfinished.
+                pieces.pop()
+
+            for idx, (start_idx, end_idx, piece) in enumerate(pieces):
+                chunk_hash = self._hash_tokens(piece)
                 logger.info(
                     "  chunk %d: start=%d, end=%d, len=%d, hash=%d, first5=%s",
-                    idx, start_idx, end_idx, token_chunk_len, chunk_hash,
-                    token_chunk[:5].tolist() if isinstance(token_chunk, torch.Tensor) else token_chunk[:5]
+                    idx, start_idx, end_idx, end_idx - start_idx, chunk_hash,
+                    piece[:5].tolist() if isinstance(piece, torch.Tensor) else piece[:5]
                 )
                 if start_idx >= num_falses:
                     if make_key:
@@ -438,7 +488,6 @@ class SegmentTokenDatabase(TokenDatabase):
                         )
                     else:
                         yield start_idx, end_idx, chunk_hash
-                start_idx = end_idx
         elif hashes is not None:
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."

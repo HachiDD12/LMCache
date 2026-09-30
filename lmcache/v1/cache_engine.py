@@ -247,6 +247,8 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        # False when `tokens` is only a prefix of the prompt being prefilled.
+        tokens_complete = kwargs.pop("tokens_complete", True)
 
         with _profiler.phase("store.token_db_and_alloc", sync_cuda=False):
             chunk_infos: List[Tuple[int, int, CacheEngineKey, torch.Size]] = []
@@ -257,6 +259,7 @@ class LMCacheEngine:
                 offsets,
                 mask,
                 request_configs=request_configs,
+                tokens_complete=tokens_complete,
             ):
                 assert isinstance(key, CacheEngineKey)
                 num_tokens = end - start
@@ -367,10 +370,15 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        # False when `tokens` is only a prefix of the prompt being prefilled.
+        tokens_complete = kwargs.pop("tokens_complete", True)
 
         with _profiler.phase("store_layer.token_db_and_alloc", sync_cuda=False):
             for start, end, key in self.token_database.process_tokens(
-                tokens=tokens, mask=mask, request_configs=request_configs
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                tokens_complete=tokens_complete,
             ):
                 assert isinstance(key, CacheEngineKey)
 
