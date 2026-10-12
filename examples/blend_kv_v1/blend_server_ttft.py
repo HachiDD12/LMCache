@@ -39,6 +39,10 @@ from lmcache.v1.cache_engine import LMCacheEngineBuilder
 
 # Local
 from prefix_cache_stats import PrefixCacheStats, PrefixCacheRequestStats
+from sibling_gate import SERVER_MODES as SIBLING_GATE_MODES
+from sibling_gate import emit_child_lines
+from sibling_gate import engine_kwargs as sibling_gate_engine_kwargs
+from sibling_gate import make_extra_args as sibling_gate_extra_args
 
 
 class ChatMessage(BaseModel):
@@ -194,6 +198,15 @@ def emit_run_manifest(mock_file: Optional[str], model: str, extra: dict) -> None
             "LMCACHE_BLEND_CHECK_LAYERS"
         ),
         "lmcache_profile_output": os.environ.get("LMCACHE_PROFILE_OUTPUT"),
+        "sibling_gate_knobs": {
+            k: os.environ.get(k)
+            for k in (
+                "SIBLING_GATE_MAX_STALL_STEPS",
+                "SIBLING_GATE_MAX_HOLD_STEPS",
+                "SIBLING_GATE_BARRIER_TIMEOUT_S",
+            )
+            if os.environ.get(k) is not None
+        },
     }
     manifest.update(extra)
     print("[MANIFEST] " + json.dumps(manifest, sort_keys=True))
@@ -235,13 +248,16 @@ def setup_environment_variables(
 
 
 @contextlib.contextmanager
-def build_llm_with_lmcache(lmcache_connector: str, model: str):
+def build_llm_with_lmcache(lmcache_connector: str, model: str,
+                           sibling_gate: str = "leader"):
     """Build LLM with LMCache integration"""
     ktc = KVTransferConfig(
         kv_connector=lmcache_connector,
         kv_role="kv_both",
     )
-    
+    # n>1 admission policy (sibling_gate.py). "off" keeps the stock scheduler.
+    gate_kwargs = sibling_gate_engine_kwargs(sibling_gate)
+
     # --tokenizer_mode mistral --config_format mistral --load_format mistral --tool-call-parser mistral --enable-auto-tool-choice --tensor-parallel-size 2
     llm_args = AsyncEngineArgs(
         model=model,
@@ -255,6 +271,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         gpu_memory_utilization=0.7,
         enable_prefix_caching=False,
         seed=42,                        # For reproducibility
+        **gate_kwargs,
     )
 
     # llm = LLM(**asdict(llm_args))
@@ -277,8 +294,10 @@ class BlendServer:
                  enable_prefix_cache_stats: bool = False,
                  prefix_cache_block_size: int = 16,
                  min_chunk_size: int = 0,
-                 chunk_dist_file: str = None):
+                 chunk_dist_file: str = None,
+                 sibling_gate: str = "leader"):
         self.model = model
+        self.sibling_gate = sibling_gate
         self.use_disk = use_disk
         self.blend_special_str = blend_special_str
         self.blend_granularity = blend_granularity
@@ -308,7 +327,9 @@ class BlendServer:
         self.tekkenizer = self.tokenizer.instruct_tokenizer.tokenizer
         
         # Initialize LLM with LMCache
-        self.llm_context = build_llm_with_lmcache(self.lmcache_connector, model)
+        self.llm_context = build_llm_with_lmcache(
+            self.lmcache_connector, model, sibling_gate=sibling_gate
+        )
         self.llm = self.llm_context.__enter__()
         
         # Create FastAPI app
@@ -355,7 +376,15 @@ class BlendServer:
                 
         except Exception as e:
             print(f"[WARNING] Failed to log request: {e}")
-    
+
+    def gate_extra_args(self, req_id: str, n: Optional[int]) -> Optional[dict]:
+        """``SamplingParams.extra_args`` that declare an n>1 request as a
+        sibling group to the engine's SiblingGateScheduler (None for n=1 or
+        when the gate is off, so those requests are unchanged)."""
+        if self.sibling_gate == "off":
+            return None
+        return sibling_gate_extra_args(req_id, n)
+
     def load_system_prompt(self, repo_id: str, filename: str) -> str:
         """Load system prompt from HuggingFace hub"""
         # try:
@@ -683,8 +712,9 @@ class BlendServer:
                 n=request.n,
                 max_tokens=request.max_tokens,
                 output_kind=RequestOutputKind.DELTA,
+                extra_args=self.gate_extra_args(req_id, request.n),
             )
-            
+
             # Variables for timing
             start_time = time.perf_counter()
             first_token_time = None
@@ -823,6 +853,7 @@ class BlendServer:
                 "blend_granularity": self.blend_granularity,
                 "min_chunk_size": self.min_chunk_size,
                 "use_disk": self.use_disk,
+                "sibling_gate": self.sibling_gate,
             },
         )
 
@@ -944,6 +975,7 @@ class BlendServer:
             n=request.n,
             max_tokens=request.max_tokens,
             output_kind=RequestOutputKind.DELTA,
+            extra_args=self.gate_extra_args(req_id, request.n),
         )
 
         # Variables for timing
@@ -951,6 +983,10 @@ class BlendServer:
         first_token_time = None
         ttft = None
         words = ""
+        # Per-child (completion_output.index) first-token time, text, finish.
+        child_ttft: dict = {}
+        child_text: dict = {}
+        child_finish: dict = {}
 
         async def _stream_once() -> None:
             nonlocal words, first_token_time, ttft
@@ -959,13 +995,21 @@ class BlendServer:
                 sampling_params=sampling_params,
                 request_id=req_id,
             ):
-                chunk_tokens = output.outputs[0].text  # assumes single completion
+                completion = output.outputs[0]  # DELTA mode: one child per output
+                chunk_tokens = completion.text
                 if chunk_tokens:
+                    now = time.perf_counter()
                     if first_token_time is None:
-                        first_token_time = time.perf_counter()
+                        first_token_time = now
                         ttft = first_token_time - start_time
                         print(f"[INFO] TTFT: {ttft:.4f} seconds (req_id={req_id})")
                     words += chunk_tokens
+                    child_ttft.setdefault(completion.index, now - start_time)
+                    child_text[completion.index] = (
+                        child_text.get(completion.index, "") + chunk_tokens
+                    )
+                if completion.finish_reason is not None:
+                    child_finish[completion.index] = completion.finish_reason
                 if output.finished:
                     break
 
@@ -976,6 +1020,9 @@ class BlendServer:
             generation_time = end_time - start_time
             print(f"[INFO] Generation time: {generation_time:.4f} seconds for {len(prompt_tokens)} tokens (req_id={req_id})")
             print(f"[INFO] Final output: {words}")
+            if request.n and request.n > 1:
+                emit_child_lines(req_id, request.n, child_ttft, child_text,
+                                 child_finish)
 
             # Build choices (mock: duplicate same text n times)
             choices = []
@@ -1225,7 +1272,18 @@ def parse_args():
         default=None,
         help="Path to write chunk size distribution (JSON format). Only used with chunk blend granularity."
     )
-    
+    parser.add_argument(
+        "--sibling-gate",
+        default="leader",
+        choices=SIBLING_GATE_MODES,
+        help="Admission policy for the children of an n>1 request "
+             "(sibling_gate.py). 'leader' (default): child 0 is admitted alone "
+             "and its siblings wait until its prefill is done, so the first "
+             "step always holds 1 child. 'all': wait until all n children "
+             "arrived, then admit them together. 'observe': stock scheduling, "
+             "[SIBLING_GATE] logging only. 'off': stock vLLM scheduler class."
+    )
+
     return parser.parse_args()
 
 
@@ -1248,9 +1306,10 @@ def main():
         enable_prefix_cache_stats=args.enable_prefix_cache_stats,
         prefix_cache_block_size=args.prefix_cache_block_size,
         min_chunk_size=args.min_chunk_size,
-        chunk_dist_file=args.chunk_dist_file
+        chunk_dist_file=args.chunk_dist_file,
+        sibling_gate=args.sibling_gate,
     )
-    
+
     print(f"Starting LMCache Blend Server on {args.host}:{args.port}")
     print(f"Model: {args.model}")
     print(f"Use disk: {args.use_disk}")
@@ -1262,6 +1321,7 @@ def main():
     if args.enable_prefix_cache_stats:
         print(f"Prefix cache block size: {args.prefix_cache_block_size}")
     print(f"Min chunk size: {args.min_chunk_size}")
+    print(f"Sibling gate: {args.sibling_gate}")
     if args.chunk_dist_file:
         print(f"Chunk distribution file: {args.chunk_dist_file}")
     

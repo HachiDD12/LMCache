@@ -31,6 +31,12 @@ from mistral_common.protocol.instruct.request import ChatCompletionRequest as Mi
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from huggingface_hub import hf_hub_download
 
+# Local
+from sibling_gate import SERVER_MODES as SIBLING_GATE_MODES
+from sibling_gate import emit_child_lines
+from sibling_gate import engine_kwargs as sibling_gate_engine_kwargs
+from sibling_gate import make_extra_args as sibling_gate_extra_args
+
 
 class ChatMessage(BaseModel):
     role: str = Field(..., description="The role of the message sender")
@@ -87,9 +93,17 @@ def setup_environment_variables(
         # Set the maximum size of the local CPU size to 5GB
         os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
-def build_llm_vllm(model: str, enable_prefix_caching: bool = False):
+def build_llm_vllm(model: str, enable_prefix_caching: bool = False,
+                   sibling_gate: str = "leader",
+                   max_num_batched_tokens: Optional[int] = None):
     """Build LLM without LMCache integration"""
     print(f"@@@@@ Building LLM with vllm")
+    # n>1 admission policy (sibling_gate.py). "off" keeps the stock scheduler.
+    extra_kwargs = sibling_gate_engine_kwargs(sibling_gate)
+    if max_num_batched_tokens is not None:
+        # None keeps vLLM's default (2048 for this entry point); the LMCache
+        # server uses 16384.
+        extra_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
     # --tokenizer_mode mistral --config_format mistral --load_format mistral --tool-call-parser mistral --enable-auto-tool-choice --tensor-parallel-size 2
     llm_args = AsyncEngineArgs(
         model=model,
@@ -102,6 +116,7 @@ def build_llm_vllm(model: str, enable_prefix_caching: bool = False):
         gpu_memory_utilization=0.7,
         enable_prefix_caching=enable_prefix_caching,
         seed=42,                        # For reproducibility
+        **extra_kwargs,
     )
 
     # llm = LLM(**asdict(llm_args))
@@ -119,13 +134,17 @@ class BlendServer:
                  model: str, 
                  use_disk: bool = False, 
                  blend_special_str: str = " # # ", 
-                 log_file: str = "chat_requests.json", 
-                 enable_prefix_caching: bool = False):
+                 log_file: str = "chat_requests.json",
+                 enable_prefix_caching: bool = False,
+                 sibling_gate: str = "leader",
+                 max_num_batched_tokens: Optional[int] = None):
         self.model = model
         self.use_disk = use_disk
         self.blend_special_str = blend_special_str
         self.log_file = log_file
         self.enable_prefix_caching = enable_prefix_caching
+        self.sibling_gate = sibling_gate
+        self.max_num_batched_tokens = max_num_batched_tokens
         
         # Setup environment variables
         setup_environment_variables(use_disk, blend_special_str)
@@ -144,7 +163,9 @@ class BlendServer:
         print(f"@@@@@ Calling build_llm_vllm...")
         sys.stdout.flush()
         try:
-            result = build_llm_vllm(model, enable_prefix_caching)
+            result = build_llm_vllm(model, enable_prefix_caching,
+                                    sibling_gate=sibling_gate,
+                                    max_num_batched_tokens=max_num_batched_tokens)
             print(f"@@@@@ build_llm_vllm returned!")
             sys.stdout.flush()
             self.llm_vllm = result
@@ -208,7 +229,15 @@ class BlendServer:
                 
         except Exception as e:
             print(f"[WARNING] Failed to log request: {e}")
-    
+
+    def gate_extra_args(self, req_id: str, n: Optional[int]) -> Optional[dict]:
+        """``SamplingParams.extra_args`` that declare an n>1 request as a
+        sibling group to the engine's SiblingGateScheduler (None for n=1 or
+        when the gate is off, so those requests are unchanged)."""
+        if self.sibling_gate == "off":
+            return None
+        return sibling_gate_extra_args(req_id, n)
+
     def load_system_prompt(self, repo_id: str, filename: str) -> str:
         """Load system prompt from HuggingFace hub"""
         # try:
@@ -349,14 +378,16 @@ class BlendServer:
             prompt_tokens = self.messages_to_prompt(request.messages)
             
             # Create sampling parameters with DELTA output for streaming
+            req_id = str(uuid.uuid4())
             sampling_params = SamplingParams(
                 temperature=request.temperature,
                 top_p=request.top_p,
                 n=request.n,
                 max_tokens=request.max_tokens,
-                output_kind=RequestOutputKind.DELTA
+                output_kind=RequestOutputKind.DELTA,
+                extra_args=self.gate_extra_args(req_id, request.n),
             )
-            
+
             # Generate response with TTFT measurement
             signal.signal(signal.SIGALRM, self.handle_timeout)
             signal.alarm(300)
@@ -367,9 +398,9 @@ class BlendServer:
             
             # Stream through the outputs to measure TTFT
             async for output in self.llm_vllm.generate(
-                prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
+                prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
                 sampling_params=sampling_params,
-                request_id=str(uuid.uuid4())
+                request_id=req_id
             ):
                 chunk_tokens = output.outputs[0].text  # assumes single completion
                 if chunk_tokens is not None:
@@ -554,7 +585,8 @@ class BlendServer:
                 top_p=request.top_p,
                 n=request.n,
                 max_tokens=request.max_tokens,
-                output_kind=RequestOutputKind.DELTA
+                output_kind=RequestOutputKind.DELTA,
+                extra_args=self.gate_extra_args(str(rid), request.n),
             )
             # print(f"@@@@@ Sampling params: {sampling_params}")
             # sys.stdout.flush()
@@ -567,23 +599,36 @@ class BlendServer:
             first_token_time = None
             words = ""
             ttft = None
-            
+            # Per-child (completion_output.index) first-token time, text, finish.
+            child_ttft: dict = {}
+            child_text: dict = {}
+            child_finish: dict = {}
+
             # Stream through the outputs to measure TTFT
             async for output in self.llm_vllm.generate(
-                prompt=TokensPrompt(prompt_token_ids=prompt_tokens), 
+                prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
                 sampling_params=sampling_params,
                 request_id=str(rid)
             ):
                 # if first_token_time is None:
                 #     print(f"@@@@@ 1st RequestOutput: {output}")
                 # print(f"@@@@@ Token: {output.outputs[0].text}")
-                chunk_tokens = output.outputs[0].text     # assumes single completion
+                completion = output.outputs[0]  # DELTA mode: one child per output
+                chunk_tokens = completion.text
                 if chunk_tokens is not None:
-                    if first_token_time is None and chunk_tokens != "":
-                        first_token_time = time.time()
-                        ttft = first_token_time - start_time
-                        print(f"[INFO] TTFT: {ttft:.4f} seconds")
+                    if chunk_tokens != "":
+                        now = time.time()
+                        if first_token_time is None:
+                            first_token_time = now
+                            ttft = first_token_time - start_time
+                            print(f"[INFO] TTFT: {ttft:.4f} seconds")
+                        child_ttft.setdefault(completion.index, now - start_time)
+                        child_text[completion.index] = (
+                            child_text.get(completion.index, "") + chunk_tokens
+                        )
                     words += chunk_tokens
+                if completion.finish_reason is not None:
+                    child_finish[completion.index] = completion.finish_reason
                 if output.finished:
                     # print(f"@@@@@ last RequestOutput: {output}")
                     break
@@ -591,9 +636,12 @@ class BlendServer:
             end_time = time.time()
             generation_time = end_time - start_time
             signal.alarm(0)
-            
+
             print(f"[INFO] Generation time: {generation_time} seconds for {len(prompt_tokens)} tokens")
             print(f"[INFO] Final output: {words}")
+            if request.n and request.n > 1:
+                emit_child_lines(str(rid), request.n, child_ttft, child_text,
+                                 child_finish)
             sys.stdout.flush()
             choices = []
             for i in range(request.n):
@@ -698,7 +746,25 @@ def parse_args():
         "--mock-file",
         help="Path to the JSON log file to replay in mock mode (required if --mock is set)"
     )
-    
+    parser.add_argument(
+        "--sibling-gate",
+        default="leader",
+        choices=SIBLING_GATE_MODES,
+        help="Admission policy for the children of an n>1 request "
+             "(sibling_gate.py). 'leader' (default): child 0 is admitted alone "
+             "and its siblings wait until its prefill is done, so the first "
+             "step always holds 1 child. 'all': wait until all n children "
+             "arrived, then admit them together. 'observe': stock scheduling, "
+             "[SIBLING_GATE] logging only. 'off': stock vLLM scheduler class."
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Per-step token budget. Default: vLLM's default for this entry "
+             "point (2048). Use 16384 to match blend_server_ttft.py."
+    )
+
     return parser.parse_args()
 
 
@@ -719,9 +785,13 @@ def main():
         use_disk=args.use_disk,
         blend_special_str=args.blend_special_str,
         log_file=args.log_file,
-        enable_prefix_caching=args.enable_prefix_caching
+        enable_prefix_caching=args.enable_prefix_caching,
+        sibling_gate=args.sibling_gate,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
     print(f"@@@@@ Enable prefix caching: {args.enable_prefix_caching}")
+    print(f"@@@@@ Sibling gate: {args.sibling_gate}")
+    print(f"@@@@@ max_num_batched_tokens: {args.max_num_batched_tokens}")
     sys.stdout.flush()
     
     print(f"@@@@@ BlendServer created successfully")
