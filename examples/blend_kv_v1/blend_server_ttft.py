@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import contextlib
+import gc
 import hashlib
 import json
 import os
@@ -165,6 +166,17 @@ def emit_request_mapping(
     sys.stdout.flush()
 
 
+# Run-script knobs for cache sizing and timing hygiene.
+#   BLEND_GPU_MEMORY_UTILIZATION  vLLM gpu_memory_utilization (default 0.7)
+#   LMCACHE_MAX_LOCAL_CPU_SIZE    LMCache CPU cache per worker, GiB (default 40)
+#   LMCACHE_PROFILE               LMCache profiler, "1" on / "0" off (lmcache/v1/profiling.py)
+#   BLEND_GC_OFF_DURING_TIMING    "1" (default) disables Python GC inside the mock
+#                                 TTFT window. Only this API-server process: vLLM's
+#                                 EngineCore and TP workers run in their own processes.
+GPU_MEMORY_UTILIZATION = float(os.environ.get("BLEND_GPU_MEMORY_UTILIZATION", "0.7"))
+GC_OFF_DURING_TIMING = os.environ.get("BLEND_GC_OFF_DURING_TIMING", "1") == "1"
+
+
 def emit_run_manifest(mock_file: Optional[str], model: str, extra: dict) -> None:
     """Emit a single ``[MANIFEST]`` line at run start.
 
@@ -197,7 +209,11 @@ def emit_run_manifest(mock_file: Optional[str], model: str, extra: dict) -> None
         "lmcache_blend_check_layers": os.environ.get(
             "LMCACHE_BLEND_CHECK_LAYERS"
         ),
+        "lmcache_profile": os.environ.get("LMCACHE_PROFILE", "0"),
         "lmcache_profile_output": os.environ.get("LMCACHE_PROFILE_OUTPUT"),
+        "lmcache_max_local_cpu_size": os.environ.get("LMCACHE_MAX_LOCAL_CPU_SIZE"),
+        "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+        "gc_off_during_timing": GC_OFF_DURING_TIMING,
         "sibling_gate_knobs": {
             k: os.environ.get(k)
             for k in (
@@ -222,8 +238,9 @@ def setup_environment_variables(
     
     # Let the run script set the chunk size
 
-    # Blending related config
-    os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
+    # Blending related config. A run script may set LMCACHE_ENABLE_BLENDING=False
+    # for a real LMCache prefix-cache baseline (ChunkedTokenDatabase).
+    os.environ.setdefault("LMCACHE_ENABLE_BLENDING", "True")
     os.environ["LMCACHE_BLEND_SPECIAL_STR"] = blend_special_str
     os.environ["LMCACHE_USE_LAYERWISE"] = "True"
 
@@ -243,8 +260,8 @@ def setup_environment_variables(
         # Enable local CPU backend in LMCache
         os.environ["LMCACHE_LOCAL_CPU"] = "True"
 
-        # Set the maximum size of the local CPU size to 40GB
-        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "40"
+        # Local CPU cache size per worker in GiB; 40 unless the run script sets it
+        os.environ.setdefault("LMCACHE_MAX_LOCAL_CPU_SIZE", "40")
 
 
 @contextlib.contextmanager
@@ -268,7 +285,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str,
         kv_transfer_config=ktc,
         max_model_len=128000,           # TODO: change this to 128000 once hosting devstral
         max_num_batched_tokens=16384,
-        gpu_memory_utilization=0.7,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         enable_prefix_caching=False,
         seed=42,                        # For reproducibility
         **gate_kwargs,
@@ -293,6 +310,7 @@ class BlendServer:
                  blend_granularity: str = "chunk",
                  enable_prefix_cache_stats: bool = False,
                  prefix_cache_block_size: int = 16,
+                 prefix_cache_capacity_tokens: int = 0,
                  min_chunk_size: int = 0,
                  chunk_dist_file: str = None,
                  sibling_gate: str = "leader"):
@@ -312,7 +330,10 @@ class BlendServer:
         
         # Initialize prefix cache stats module if enabled
         if enable_prefix_cache_stats:
-            self.prefix_cache_stats = PrefixCacheStats(block_size=prefix_cache_block_size)
+            self.prefix_cache_stats = PrefixCacheStats(
+                block_size=prefix_cache_block_size,
+                capacity_tokens=prefix_cache_capacity_tokens,
+            )
         else:
             self.prefix_cache_stats = None
         
@@ -854,6 +875,13 @@ class BlendServer:
                 "min_chunk_size": self.min_chunk_size,
                 "use_disk": self.use_disk,
                 "sibling_gate": self.sibling_gate,
+                "lmcache_enable_blending": os.environ.get("LMCACHE_ENABLE_BLENDING"),
+                "prefix_cache_stats": (
+                    None if self.prefix_cache_stats is None else {
+                        "block_size": self.prefix_cache_stats.block_size,
+                        "capacity_tokens": self.prefix_cache_stats.capacity_tokens,
+                    }
+                ),
             },
         )
 
@@ -978,7 +1006,10 @@ class BlendServer:
             extra_args=self.gate_extra_args(req_id, request.n),
         )
 
-        # Variables for timing
+        # Variables for timing. Mock requests run one at a time, so the
+        # process-wide GC switch only covers this request's window.
+        if GC_OFF_DURING_TIMING:
+            gc.disable()
         start_time = time.perf_counter()
         first_token_time = None
         ttft = None
@@ -1017,6 +1048,8 @@ class BlendServer:
             # Enforce a hard timeout for the whole streaming operation (e.g., 300s)
             await asyncio.wait_for(_stream_once(), timeout=300.0)
             end_time = time.perf_counter()
+            if GC_OFF_DURING_TIMING:
+                gc.enable()
             generation_time = end_time - start_time
             print(f"[INFO] Generation time: {generation_time:.4f} seconds for {len(prompt_tokens)} tokens (req_id={req_id})")
             print(f"[INFO] Final output: {words}")
@@ -1061,7 +1094,11 @@ class BlendServer:
         except Exception as e:
             print(f"[ERROR] Error handling chat completion (req_id={req_id}), type: {type(e)}, message: {str(e)}")
             raise
-    
+        finally:
+            # Timeout/error paths skip the gc.enable() above
+            if GC_OFF_DURING_TIMING:
+                gc.enable()
+
     async def handle_chat_completion_mock_v0(
         self,
         request: ChatCompletionRequest,
@@ -1261,6 +1298,12 @@ def parse_args():
         help="Block size for prefix cache statistics (default: 16, following vLLM convention)"
     )
     parser.add_argument(
+        "--prefix-cache-capacity-tokens",
+        type=int,
+        default=0,
+        help="LRU capacity of the simulated prefix cache, in tokens (default: 0, unlimited)"
+    )
+    parser.add_argument(
         "--min-chunk-size",
         type=int,
         default=0,
@@ -1305,6 +1348,7 @@ def main():
         blend_granularity=args.blend_granularity,
         enable_prefix_cache_stats=args.enable_prefix_cache_stats,
         prefix_cache_block_size=args.prefix_cache_block_size,
+        prefix_cache_capacity_tokens=args.prefix_cache_capacity_tokens,
         min_chunk_size=args.min_chunk_size,
         chunk_dist_file=args.chunk_dist_file,
         sibling_gate=args.sibling_gate,
@@ -1320,6 +1364,7 @@ def main():
     print(f"Prefix cache stats enabled: {args.enable_prefix_cache_stats}")
     if args.enable_prefix_cache_stats:
         print(f"Prefix cache block size: {args.prefix_cache_block_size}")
+        print(f"Prefix cache capacity (tokens, 0 = unlimited): {args.prefix_cache_capacity_tokens}")
     print(f"Min chunk size: {args.min_chunk_size}")
     print(f"Sibling gate: {args.sibling_gate}")
     if args.chunk_dist_file:

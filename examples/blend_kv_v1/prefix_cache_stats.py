@@ -2,13 +2,15 @@
 """
 Prefix Cache Statistics Module
 
-Implements a trie-based prefix cache simulator that tracks theoretical upper bound
-on prefix cache hit rates. Uses 16-token blocks following vLLM convention.
+Implements a trie-based prefix cache simulator. Uses 16-token blocks following
+vLLM convention.
 
 This module can be attached to BlendServer to measure how many tokens in each request
-would theoretically be cache hits if we had infinite cache and perfect prefix matching.
+would be prefix cache hits, either with an unlimited cache (the theoretical upper
+bound) or with an LRU cache of a fixed token capacity.
 """
 
+from collections import OrderedDict
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
@@ -26,11 +28,15 @@ class PrefixCacheRequestStats:
 
 class PrefixCacheTrieNode:
     """A node in the prefix cache trie"""
-    __slots__ = ['children']
+    __slots__ = ['children', 'parent', 'block']
     
-    def __init__(self):
+    def __init__(self, parent: Optional['PrefixCacheTrieNode'] = None,
+                 block: Optional[Tuple[int, ...]] = None):
         # Maps token block (as tuple) -> child node
         self.children: Dict[Tuple[int, ...], 'PrefixCacheTrieNode'] = {}
+        # Parent node and the block on the edge into this node (for eviction)
+        self.parent = parent
+        self.block = block
 
 
 class PrefixCacheStats:
@@ -42,25 +48,34 @@ class PrefixCacheStats:
     
     Following vLLM convention, we use 16-token blocks by default.
     
-    The cache is assumed to be infinitely large (no eviction policy).
+    With capacity_tokens=0 the cache is infinitely large (no eviction policy).
+    Otherwise blocks are evicted in LRU order once the cached tokens exceed
+    capacity_tokens. Each request touches its whole path deepest-block-first,
+    so a parent is always more recent than its children and the LRU end is
+    always a leaf (the order vLLM's free-block queue evicts in).
     
     Usage:
-        cache_stats = PrefixCacheStats(block_size=16)
+        cache_stats = PrefixCacheStats(block_size=16, capacity_tokens=411436)
         
         # For each request:
         stats = cache_stats.get_request_cache_stats(prompt_tokens)
         print(f"Hit tokens: {stats.hit_tokens}, Hit ratio: {stats.hit_ratio}")
     """
     
-    def __init__(self, block_size: int = 16):
+    def __init__(self, block_size: int = 16, capacity_tokens: int = 0):
         """
         Initialize the prefix cache stats tracker.
         
         Args:
             block_size: Number of tokens per block (default: 16, following vLLM convention)
+            capacity_tokens: LRU capacity in tokens; 0 means unlimited
         """
         self.block_size = block_size
+        self.capacity_tokens = capacity_tokens
         self.root = PrefixCacheTrieNode()
+        self.cached_tokens = 0
+        # Trie nodes, least recently used first (only maintained when bounded)
+        self._lru: "OrderedDict[PrefixCacheTrieNode, None]" = OrderedDict()
         
         # Track cumulative statistics
         self.total_requests = 0
@@ -111,6 +126,7 @@ class PrefixCacheStats:
         hit_tokens = 0
         current_node = self.root
         match_depth = 0  # Number of blocks that matched
+        path: List[PrefixCacheTrieNode] = []
         
         for block in blocks:
             if block in current_node.children:
@@ -118,15 +134,21 @@ class PrefixCacheStats:
                 hit_tokens += len(block)
                 current_node = current_node.children[block]
                 match_depth += 1
+                path.append(current_node)
             else:
                 # No match - stop traversing
                 break
         
         # Insert remaining (unmatched) blocks into the trie
         for block in blocks[match_depth:]:
-            new_node = PrefixCacheTrieNode()
+            new_node = PrefixCacheTrieNode(current_node, block)
             current_node.children[block] = new_node
             current_node = new_node
+            self.cached_tokens += len(block)
+            path.append(new_node)
+        
+        if self.capacity_tokens > 0:
+            self._touch_and_evict(path)
         
         # Calculate statistics
         total_tokens = len(prompt_tokens)
@@ -142,6 +164,17 @@ class PrefixCacheStats:
             total_tokens=total_tokens,
             hit_ratio=hit_ratio
         )
+    
+    def _touch_and_evict(self, path: List[PrefixCacheTrieNode]) -> None:
+        """Mark path most recent (deepest block oldest), then evict to capacity."""
+        for node in reversed(path):
+            self._lru.pop(node, None)
+            self._lru[node] = None
+        while self.cached_tokens > self.capacity_tokens:
+            node, _ = self._lru.popitem(last=False)
+            assert not node.children, "LRU victim must be a leaf"
+            del node.parent.children[node.block]
+            self.cached_tokens -= len(node.block)
     
     def get_cumulative_stats(self) -> Dict:
         """
@@ -159,12 +192,16 @@ class PrefixCacheStats:
             'total_requests': self.total_requests,
             'total_hit_tokens': self.total_hit_tokens,
             'total_tokens': self.total_tokens,
-            'overall_hit_ratio': overall_hit_ratio
+            'overall_hit_ratio': overall_hit_ratio,
+            'capacity_tokens': self.capacity_tokens,
+            'cached_tokens': self.cached_tokens,
         }
     
     def reset(self):
         """Reset the cache and statistics to initial state"""
         self.root = PrefixCacheTrieNode()
+        self.cached_tokens = 0
+        self._lru.clear()
         self.total_requests = 0
         self.total_hit_tokens = 0
         self.total_tokens = 0
@@ -221,6 +258,17 @@ if __name__ == "__main__":
     # Print cumulative stats
     print(f"\nCumulative stats: {cache.get_cumulative_stats()}")
     print(f"Cache size (blocks): {cache.get_cache_size_blocks()}")
+    
+    # LRU: 8-token capacity, 4-token blocks
+    lru = PrefixCacheStats(block_size=4, capacity_tokens=8)
+    assert lru.get_request_cache_stats([1, 2, 3, 4, 5, 6, 7, 8]).hit_tokens == 0
+    # Inserting [9..12] evicts the deepest, oldest block [5..8]
+    assert lru.get_request_cache_stats([9, 10, 11, 12]).hit_tokens == 0
+    # [1..4] survived; re-inserting [5..8] evicts [9..12]
+    assert lru.get_request_cache_stats([1, 2, 3, 4, 5, 6, 7, 8]).hit_tokens == 4
+    assert lru.get_request_cache_stats([9, 10, 11, 12]).hit_tokens == 0
+    assert lru.cached_tokens <= 8
+    print(f"LRU cumulative stats: {lru.get_cumulative_stats()}")
     
     print("\nAll tests passed!")
 
