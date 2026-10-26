@@ -212,6 +212,7 @@ def emit_run_manifest(mock_file: Optional[str], model: str, extra: dict) -> None
         "lmcache_profile": os.environ.get("LMCACHE_PROFILE", "0"),
         "lmcache_profile_output": os.environ.get("LMCACHE_PROFILE_OUTPUT"),
         "lmcache_max_local_cpu_size": os.environ.get("LMCACHE_MAX_LOCAL_CPU_SIZE"),
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
         "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
         "gc_off_during_timing": GC_OFF_DURING_TIMING,
         "sibling_gate_knobs": {
@@ -241,6 +242,16 @@ def setup_environment_variables(
     # Blending related config. A run script may set LMCACHE_ENABLE_BLENDING=False
     # for a real LMCache prefix-cache baseline (ChunkedTokenDatabase).
     os.environ.setdefault("LMCACHE_ENABLE_BLENDING", "True")
+    # Without blending, the scheduler hashes chunks itself and sends only the
+    # hashes to the workers (lmcache_lookup_client.py). Python salts hash() per
+    # process and vLLM seeds NONE_HASH from os.urandom unless PYTHONHASHSEED is
+    # set, so every lookup would miss. It must be exported before Python starts.
+    blending = os.environ["LMCACHE_ENABLE_BLENDING"].strip().lower() in ("true", "1")
+    if not blending and os.environ.get("PYTHONHASHSEED") is None:
+        raise RuntimeError(
+            "LMCACHE_ENABLE_BLENDING=False needs PYTHONHASHSEED exported by the "
+            "run script (e.g. export PYTHONHASHSEED=0), or no lookup will hit."
+        )
     os.environ["LMCACHE_BLEND_SPECIAL_STR"] = blend_special_str
     os.environ["LMCACHE_USE_LAYERWISE"] = "True"
 
