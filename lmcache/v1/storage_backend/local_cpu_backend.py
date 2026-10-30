@@ -112,7 +112,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # flip the order of the keys in the request
         with self.cpu_lock:
             for key in reversed(self.keys_in_request):
-                self.cache_policy.update_on_hit(key, self.hot_cache)
+                # Eviction can remove a chunk whose layer-0 key a lookup just
+                # pinned (batched_allocate evicts every layer of a chunk when
+                # any one layer key is evictable), so skip keys that are gone
+                # instead of raising KeyError in the lookup server thread.
+                if key in self.hot_cache:
+                    self.cache_policy.update_on_hit(key, self.hot_cache)
             self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
